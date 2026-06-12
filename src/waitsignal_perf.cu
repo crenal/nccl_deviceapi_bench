@@ -4,8 +4,13 @@
 #include <nccl.h>
 #include <nccl_device.h>
 
+#include "common/checks.hpp"
+#include "common/mpi.hpp"
+#include "common/parse.hpp"
+#include "common/stats.hpp"
+#include "common/timer.cuh"
+
 #include <algorithm>
-#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -21,43 +26,9 @@
 #error "waitsignal_perf requires NCCL 2.29.0 or newer"
 #endif
 
-#define CUDA_CHECK(stmt)                                                     \
-  do {                                                                       \
-    cudaError_t _err = (stmt);                                               \
-    if (_err != cudaSuccess) {                                                \
-      std::ostringstream _oss;                                                \
-      _oss << "CUDA error at " << __FILE__ << ":" << __LINE__ << ": "       \
-           << cudaGetErrorString(_err);                                      \
-      throw std::runtime_error(_oss.str());                                  \
-    }                                                                        \
-  } while (0)
-
-#define NCCL_CHECK(stmt)                                                     \
-  do {                                                                       \
-    ncclResult_t _err = (stmt);                                              \
-    if (_err != ncclSuccess) {                                                \
-      std::ostringstream _oss;                                                \
-      _oss << "NCCL error at " << __FILE__ << ":" << __LINE__ << ": "       \
-           << ncclGetErrorString(_err);                                      \
-      throw std::runtime_error(_oss.str());                                  \
-    }                                                                        \
-  } while (0)
-
-#define MPI_CHECK(stmt)                                                      \
-  do {                                                                       \
-    int _err = (stmt);                                                       \
-    if (_err != MPI_SUCCESS) {                                               \
-      char _msg[MPI_MAX_ERROR_STRING];                                       \
-      int _len = 0;                                                          \
-      MPI_Error_string(_err, _msg, &_len);                                   \
-      std::ostringstream _oss;                                                \
-      _oss << "MPI error at " << __FILE__ << ":" << __LINE__ << ": "        \
-           << std::string(_msg, _len);                                       \
-      throw std::runtime_error(_oss.str());                                  \
-    }                                                                        \
-  } while (0)
-
 namespace {
+
+using namespace nccl_deviceapi_test;
 
 constexpr int kTraceSlots = 4;
 constexpr int kGinSignalCount = 8;
@@ -83,30 +54,8 @@ struct Sample {
   uint64_t signal_after_to_wait_done_ticks = 0;
 };
 
-struct Stats {
-  double min_us = 0.0;
-  double max_us = 0.0;
-  double p50_us = 0.0;
-  double p99_us = 0.0;
-};
-
 __device__ __forceinline__ uint64_t globaltimer() {
-  uint64_t t;
-  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-  return t;
-}
-
-__global__ void calibrate_timer_kernel(uint64_t *ticks, uint64_t spin_ticks) {
-  if (threadIdx.x != 0 || blockIdx.x != 0) {
-    return;
-  }
-  uint64_t t0 = globaltimer();
-  uint64_t t1 = t0;
-  while (t1 - t0 < spin_ticks) {
-    t1 = globaltimer();
-  }
-  ticks[0] = t0;
-  ticks[1] = t1;
+  return global_timer();
 }
 
 __global__ __launch_bounds__(32, 2) void waitsignal_trace_kernel(
@@ -136,16 +85,6 @@ __global__ __launch_bounds__(32, 2) void waitsignal_trace_kernel(
     cuda::atomic_ref<uint64_t>{*signal_ptr.ptr}.fetch_add(1, cuda::memory_order_release);
     trace_ticks[kSignalAfter] = globaltimer();
   }
-}
-
-static int parse_int(const std::string &text, const char *flag) {
-  char *end = nullptr;
-  long v = std::strtol(text.c_str(), &end, 10);
-  if (end == text.c_str() || *end != '\0' || v < std::numeric_limits<int>::min() ||
-      v > std::numeric_limits<int>::max()) {
-    throw std::invalid_argument(std::string("invalid integer for ") + flag + ": " + text);
-  }
-  return static_cast<int>(v);
 }
 
 static Options parse_args(int argc, char **argv) {
@@ -186,71 +125,18 @@ static Options parse_args(int argc, char **argv) {
   return opt;
 }
 
-static int local_rank(MPI_Comm world) {
-  MPI_Comm local = MPI_COMM_NULL;
-  MPI_CHECK(MPI_Comm_split_type(world, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &local));
-  int rank = 0;
-  MPI_CHECK(MPI_Comm_rank(local, &rank));
-  MPI_CHECK(MPI_Comm_free(&local));
-  return rank;
-}
-
-static double calibrate_timer_ticks_per_us() {
-  constexpr uint64_t kSpinTicks = 100000000ULL;
-  uint64_t *ticks_d = nullptr;
-  uint64_t ticks_h[2] = {};
-  cudaEvent_t start{};
-  cudaEvent_t stop{};
-  CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&ticks_d), sizeof(ticks_h)));
-  CUDA_CHECK(cudaEventCreate(&start));
-  CUDA_CHECK(cudaEventCreate(&stop));
-
-  CUDA_CHECK(cudaEventRecord(start));
-  calibrate_timer_kernel<<<1, 1>>>(ticks_d, kSpinTicks);
-  CUDA_CHECK(cudaEventRecord(stop));
-  CUDA_CHECK(cudaGetLastError());
-  CUDA_CHECK(cudaEventSynchronize(stop));
-
-  float elapsed_ms = 0.0f;
-  CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
-  CUDA_CHECK(cudaMemcpy(ticks_h, ticks_d, sizeof(ticks_h), cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaEventDestroy(start));
-  CUDA_CHECK(cudaEventDestroy(stop));
-  CUDA_CHECK(cudaFree(ticks_d));
-
-  uint64_t elapsed_ticks = ticks_h[1] - ticks_h[0];
-  if (elapsed_ticks == 0 || elapsed_ms <= 0.0f) {
-    throw std::runtime_error("failed to calibrate globaltimer");
-  }
-  return static_cast<double>(elapsed_ticks) / (static_cast<double>(elapsed_ms) * 1000.0);
-}
-
 static double ticks_to_us(uint64_t ticks, double ticks_per_us) {
   return static_cast<double>(ticks) / ticks_per_us;
 }
 
-static double percentile_nearest(const std::vector<double> &sorted_values, double percentile) {
-  if (sorted_values.empty()) {
-    return 0.0;
-  }
-  const double rank = std::ceil((percentile / 100.0) * sorted_values.size());
-  const size_t index = static_cast<size_t>(std::max(1.0, rank)) - 1;
-  return sorted_values[std::min(index, sorted_values.size() - 1)];
-}
-
-static Stats compute_stats(const std::vector<uint64_t> &ticks, double ticks_per_us) {
-  std::vector<double> values;
-  values.reserve(ticks.size());
-  for (uint64_t tick : ticks) {
-    values.push_back(ticks_to_us(tick, ticks_per_us));
-  }
+static MetricStats compute_tick_stats(const std::vector<uint64_t> &ticks, double ticks_per_us) {
+  std::vector<double> values = nccl_deviceapi_test::ticks_to_us(ticks, ticks_per_us);
   std::sort(values.begin(), values.end());
-
-  Stats stats;
-  stats.min_us = values.front();
-  stats.max_us = values.back();
-  stats.p50_us = percentile_nearest(values, 50.0);
-  stats.p99_us = percentile_nearest(values, 99.0);
+  MetricStats stats;
+  stats.min = values.front();
+  stats.max = values.back();
+  stats.p50 = percentile_nearest_percent(values, 50.0);
+  stats.p99 = percentile_nearest_percent(values, 99.0);
   return stats;
 }
 
@@ -294,13 +180,13 @@ static void write_csv(const std::string &path, const std::vector<Sample> &sample
                   sample.signal_after_to_wait_done_ticks, ticks_per_us, sample);
   }
 
-  auto write_summary = [&](const char *metric, const Stats &stats) {
-    csv << "summary,," << metric << ",,," << stats.min_us << ','
-        << stats.max_us << ',' << stats.p50_us << ',' << stats.p99_us << ",,,,\n";
+  auto write_summary = [&](const char *metric, const MetricStats &stats) {
+    csv << "summary,," << metric << ",,," << stats.min << ','
+        << stats.max << ',' << stats.p50 << ',' << stats.p99 << ",,,,\n";
   };
-  write_summary("local_atomic_add", compute_stats(local_atomic_add, ticks_per_us));
-  write_summary("signal_to_wait_done", compute_stats(signal_to_wait_done, ticks_per_us));
-  write_summary("signal_after_to_wait_done", compute_stats(signal_after_to_wait_done, ticks_per_us));
+  write_summary("local_atomic_add", compute_tick_stats(local_atomic_add, ticks_per_us));
+  write_summary("signal_to_wait_done", compute_tick_stats(signal_to_wait_done, ticks_per_us));
+  write_summary("signal_after_to_wait_done", compute_tick_stats(signal_after_to_wait_done, ticks_per_us));
 }
 
 static void print_summary(const std::vector<Sample> &samples, int warmup_iters,
@@ -317,11 +203,11 @@ static void print_summary(const std::vector<Sample> &samples, int warmup_iters,
     signal_after_to_wait_done.push_back(sample.signal_after_to_wait_done_ticks);
   }
 
-  auto print_metric = [&](const char *name, const Stats &stats) {
+  auto print_metric = [&](const char *name, const MetricStats &stats) {
     std::cout << std::left << std::setw(28) << name << std::setw(16)
-              << stats.min_us << std::setw(16) << stats.max_us
-              << std::setw(16) << stats.p50_us << std::setw(16)
-              << stats.p99_us << '\n';
+              << stats.min << std::setw(16) << stats.max
+              << std::setw(16) << stats.p50 << std::setw(16)
+              << stats.p99 << '\n';
   };
 
   std::cout << "# GIN waitSignal same-GPU local-atomic trace\n";
@@ -331,9 +217,9 @@ static void print_summary(const std::vector<Sample> &samples, int warmup_iters,
             << std::setw(16) << "max_us" << std::setw(16) << "p50_us"
             << std::setw(16) << "p99_us" << '\n';
   std::cout << std::setprecision(4) << std::fixed;
-  print_metric("local_atomic_add", compute_stats(local_atomic_add, ticks_per_us));
-  print_metric("signal_to_wait_done", compute_stats(signal_to_wait_done, ticks_per_us));
-  print_metric("signal_after_to_wait_done", compute_stats(signal_after_to_wait_done, ticks_per_us));
+  print_metric("local_atomic_add", compute_tick_stats(local_atomic_add, ticks_per_us));
+  print_metric("signal_to_wait_done", compute_tick_stats(signal_to_wait_done, ticks_per_us));
+  print_metric("signal_after_to_wait_done", compute_tick_stats(signal_after_to_wait_done, ticks_per_us));
 }
 
 }  // namespace
@@ -351,7 +237,7 @@ int main(int argc, char **argv) {
     MPI_CHECK(MPI_Comm_rank(MPI_COMM_WORLD, &rank));
     MPI_CHECK(MPI_Comm_size(MPI_COMM_WORLD, &nranks));
 
-    int dev = local_rank(MPI_COMM_WORLD);
+    int dev = mpi_local_rank(MPI_COMM_WORLD);
     int dev_count = 0;
     CUDA_CHECK(cudaGetDeviceCount(&dev_count));
     if (dev_count <= 0 || dev >= dev_count) {
@@ -360,13 +246,9 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaSetDevice(dev));
 
     double timer_ticks_per_us =
-        opt.ticks_per_us > 0.0 ? opt.ticks_per_us : calibrate_timer_ticks_per_us();
+        opt.ticks_per_us > 0.0 ? opt.ticks_per_us : calibrate_ticks_per_us(100000000ULL);
 
-    ncclUniqueId id{};
-    if (rank == 0) {
-      NCCL_CHECK(ncclGetUniqueId(&id));
-    }
-    MPI_CHECK(MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD));
+    ncclUniqueId id = mpi_bcast_nccl_unique_id(rank, MPI_COMM_WORLD);
 
     ncclComm_t comm = nullptr;
     ncclDevComm dev_comm{};

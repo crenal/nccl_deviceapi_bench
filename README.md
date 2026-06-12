@@ -9,6 +9,17 @@ This repository collects the standalone NCCL device API microbenchmarks used for
 
 The benchmarks are intentionally small and do not modify NCCL. `barrier-test` and `bcast-multimem-test` include NCCL private symmetric headers, so they require an NCCL source tree in addition to an NCCL build/install tree.
 
+## Layout
+
+```text
+src/common/                      shared parsing, checks, MPI, socket OOB, stats, and timer helpers
+src/nccl_gin_pingpong_perf.cu     two-rank GIN pingpong benchmark
+src/waitsignal_perf.cu            GIN waitSignal trace benchmark
+src/barrier_test.cu               GIN/world barrier benchmark
+src/bcast_multimem_test.cu        LSA bcastMultimem benchmark
+scripts/                          example launch scripts
+```
+
 ## Build
 
 Example on the current test machines:

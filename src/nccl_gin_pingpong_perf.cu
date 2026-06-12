@@ -3,8 +3,12 @@
 #include <nccl.h>
 #include <nccl_device.h>
 
+#include "common/checks.hpp"
+#include "common/mpi.hpp"
+#include "common/parse.hpp"
+#include "common/timer.cuh"
+
 #include <algorithm>
-#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -21,43 +25,9 @@
 #error "NCCL GIN pingpong requires NCCL 2.29.0 or newer"
 #endif
 
-#define CUDA_CHECK(stmt)                                                     \
-  do {                                                                       \
-    cudaError_t _err = (stmt);                                               \
-    if (_err != cudaSuccess) {                                                \
-      std::ostringstream _oss;                                                \
-      _oss << "CUDA error at " << __FILE__ << ":" << __LINE__ << ": "       \
-           << cudaGetErrorString(_err);                                      \
-      throw std::runtime_error(_oss.str());                                  \
-    }                                                                        \
-  } while (0)
-
-#define NCCL_CHECK(stmt)                                                     \
-  do {                                                                       \
-    ncclResult_t _err = (stmt);                                              \
-    if (_err != ncclSuccess) {                                                \
-      std::ostringstream _oss;                                                \
-      _oss << "NCCL error at " << __FILE__ << ":" << __LINE__ << ": "       \
-           << ncclGetErrorString(_err);                                      \
-      throw std::runtime_error(_oss.str());                                  \
-    }                                                                        \
-  } while (0)
-
-#define MPI_CHECK(stmt)                                                      \
-  do {                                                                       \
-    int _err = (stmt);                                                       \
-    if (_err != MPI_SUCCESS) {                                               \
-      char _msg[MPI_MAX_ERROR_STRING];                                       \
-      int _len = 0;                                                          \
-      MPI_Error_string(_err, _msg, &_len);                                   \
-      std::ostringstream _oss;                                                \
-      _oss << "MPI error at " << __FILE__ << ":" << __LINE__ << ": "        \
-           << std::string(_msg, _len);                                       \
-      throw std::runtime_error(_oss.str());                                  \
-    }                                                                        \
-  } while (0)
-
 namespace {
+
+using namespace nccl_deviceapi_test;
 
 constexpr int kKernelThreads = 32;
 constexpr int kGinResourceCount = 16;
@@ -82,22 +52,7 @@ struct Sample {
 };
 
 __device__ __forceinline__ uint64_t globaltimer() {
-  uint64_t t;
-  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-  return t;
-}
-
-__global__ void calibrate_timer_kernel(uint64_t *ticks, uint64_t spin_ticks) {
-  if (threadIdx.x != 0 || blockIdx.x != 0) {
-    return;
-  }
-  uint64_t t0 = globaltimer();
-  uint64_t t1 = t0;
-  while (t1 - t0 < spin_ticks) {
-    t1 = globaltimer();
-  }
-  ticks[0] = t0;
-  ticks[1] = t1;
+  return global_timer();
 }
 
 __global__ void init_buffers_kernel(char *sendbuf, char *recvbuf, size_t bytes, int rank) {
@@ -184,41 +139,6 @@ __global__ void nccl_gin_pingpong_kernel(ncclWindow_t sendwin, ncclWindow_t recv
   world_bar.sync(cta, cuda::memory_order_acquire, ncclGinFenceLevel::Relaxed);
 }
 
-static size_t parse_size(const std::string &text) {
-  if (text.empty()) {
-    throw std::invalid_argument("empty size");
-  }
-  size_t pos = 0;
-  double value = std::stod(text, &pos);
-  std::string suffix = text.substr(pos);
-  std::transform(suffix.begin(), suffix.end(), suffix.begin(),
-                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-
-  double scale = 1.0;
-  if (suffix.empty() || suffix == "b") {
-    scale = 1.0;
-  } else if (suffix == "k" || suffix == "kb" || suffix == "kib") {
-    scale = 1024.0;
-  } else if (suffix == "m" || suffix == "mb" || suffix == "mib") {
-    scale = 1024.0 * 1024.0;
-  } else if (suffix == "g" || suffix == "gb" || suffix == "gib") {
-    scale = 1024.0 * 1024.0 * 1024.0;
-  } else {
-    throw std::invalid_argument("unknown size suffix: " + suffix);
-  }
-  return static_cast<size_t>(value * scale);
-}
-
-static int parse_int(const std::string &text, const char *flag) {
-  char *end = nullptr;
-  long v = std::strtol(text.c_str(), &end, 10);
-  if (end == text.c_str() || *end != '\0' || v < std::numeric_limits<int>::min() ||
-      v > std::numeric_limits<int>::max()) {
-    throw std::invalid_argument(std::string("invalid integer for ") + flag + ": " + text);
-  }
-  return static_cast<int>(v);
-}
-
 static Options parse_args(int argc, char **argv) {
   Options opt;
   for (int i = 1; i < argc; ++i) {
@@ -269,45 +189,6 @@ static Options parse_args(int argc, char **argv) {
     throw std::invalid_argument("--ticks-per-us must be positive");
   }
   return opt;
-}
-
-static int local_rank(MPI_Comm world) {
-  MPI_Comm local = MPI_COMM_NULL;
-  MPI_CHECK(MPI_Comm_split_type(world, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &local));
-  int rank = 0;
-  MPI_CHECK(MPI_Comm_rank(local, &rank));
-  MPI_CHECK(MPI_Comm_free(&local));
-  return rank;
-}
-
-static double calibrate_timer_ticks_per_us() {
-  constexpr uint64_t kSpinTicks = 100000000ULL;
-  uint64_t *ticks_d = nullptr;
-  uint64_t ticks_h[2] = {};
-  cudaEvent_t start{};
-  cudaEvent_t stop{};
-  CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&ticks_d), sizeof(ticks_h)));
-  CUDA_CHECK(cudaEventCreate(&start));
-  CUDA_CHECK(cudaEventCreate(&stop));
-
-  CUDA_CHECK(cudaEventRecord(start));
-  calibrate_timer_kernel<<<1, 1>>>(ticks_d, kSpinTicks);
-  CUDA_CHECK(cudaEventRecord(stop));
-  CUDA_CHECK(cudaGetLastError());
-  CUDA_CHECK(cudaEventSynchronize(stop));
-
-  float elapsed_ms = 0.0f;
-  CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
-  CUDA_CHECK(cudaMemcpy(ticks_h, ticks_d, sizeof(ticks_h), cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaEventDestroy(start));
-  CUDA_CHECK(cudaEventDestroy(stop));
-  CUDA_CHECK(cudaFree(ticks_d));
-
-  uint64_t elapsed_ticks = ticks_h[1] - ticks_h[0];
-  if (elapsed_ticks == 0 || elapsed_ms <= 0.0f) {
-    throw std::runtime_error("failed to calibrate globaltimer");
-  }
-  return static_cast<double>(elapsed_ticks) / (static_cast<double>(elapsed_ms) * 1000.0);
 }
 
 static void write_csv(const std::string &path, int rank, const Options &opt,
@@ -405,7 +286,7 @@ int main(int argc, char **argv) {
       return 2;
     }
 
-    int dev = local_rank(MPI_COMM_WORLD);
+    int dev = mpi_local_rank(MPI_COMM_WORLD);
     int dev_count = 0;
     CUDA_CHECK(cudaGetDeviceCount(&dev_count));
     if (dev_count <= 0 || dev >= dev_count) {
@@ -414,13 +295,9 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaSetDevice(dev));
 
     double timer_ticks_per_us =
-        opt.ticks_per_us > 0.0 ? opt.ticks_per_us : calibrate_timer_ticks_per_us();
+        opt.ticks_per_us > 0.0 ? opt.ticks_per_us : calibrate_ticks_per_us(100000000ULL);
 
-    ncclUniqueId id{};
-    if (rank == 0) {
-      NCCL_CHECK(ncclGetUniqueId(&id));
-    }
-    MPI_CHECK(MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD));
+    ncclUniqueId id = mpi_bcast_nccl_unique_id(rank, MPI_COMM_WORLD);
 
     ncclComm_t comm = nullptr;
     ncclDevComm dev_comm{};

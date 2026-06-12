@@ -61,6 +61,7 @@ set(COMMON_CUDA_OPTIONS
 
 function(configure_cuda_target target)
   target_include_directories(${target} PRIVATE
+    "${PROJECT_SOURCE_DIR}/src"
     "${NCCL_INCLUDE_DIR}"
     ${NCCL_PRIVATE_INCLUDE_DIRS})
   target_compile_definitions(${target} PRIVATE NCCL_OS_LINUX=1)
