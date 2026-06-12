@@ -39,6 +39,8 @@ struct Options {
   int iters = 1000;
   int threads = ncclSymkMaxThreads;
   int num_blocks = 1;
+  int split_blocks = 4;
+  size_t split_threshold_recv_bytes = 4ull << 20;
   int gin_contexts = 4;
   int device = -1;
   int port = 22540;
@@ -54,6 +56,7 @@ void usage(const char* argv0) {
   std::fprintf(stderr,
       "Usage: %s [--min-bytes N] [--max-bytes N] [--factor N]\n"
       "          [--warmup N] [--iters N] [--threads N] [--num-blocks N]\n"
+      "          [--split-blocks N] [--split-threshold N]\n"
       "          [--gin-contexts N] [--device ID] [--master ADDR] [--port PORT]\n"
       "          [--ticks-per-us X] [--stats-mode rank|collective]\n"
       "          [--kernel railring|oneshot-rail] [--check]\n",
@@ -88,6 +91,10 @@ Options parse_args(int argc, char** argv) {
       opt.threads = std::atoi(need(argv[i]));
     } else if (std::strcmp(argv[i], "--num-blocks") == 0) {
       opt.num_blocks = std::atoi(need(argv[i]));
+    } else if (std::strcmp(argv[i], "--split-blocks") == 0) {
+      opt.split_blocks = std::atoi(need(argv[i]));
+    } else if (std::strcmp(argv[i], "--split-threshold") == 0) {
+      opt.split_threshold_recv_bytes = parse_size(need(argv[i]));
     } else if (std::strcmp(argv[i], "--gin-contexts") == 0) {
       opt.gin_contexts = std::atoi(need(argv[i]));
     } else if (std::strcmp(argv[i], "--device") == 0) {
@@ -137,11 +144,18 @@ Options parse_args(int argc, char** argv) {
   if (opt.min_bytes == 0 || opt.max_bytes < opt.min_bytes || opt.factor <= 1 ||
       opt.warmup < 0 || opt.iters <= 0 || opt.threads <= WARP_SIZE || opt.threads > 1024 ||
       (opt.threads % WARP_SIZE) != 0 || opt.num_blocks <= 0 || opt.num_blocks > ncclSymkMaxBlocks ||
+      opt.split_blocks <= 0 || opt.split_blocks > ncclSymkMaxBlocks ||
       opt.gin_contexts <= 0 || opt.port <= 0 || opt.ticks_per_us < 0.0) {
     std::fprintf(stderr, "Invalid arguments\n");
     std::exit(3);
   }
   return opt;
+}
+
+int launch_blocks_for_size(const Options& opt, size_t send_bytes, int nranks) {
+  if (opt.kernel_kind != kOneshotRail || opt.split_blocks <= opt.num_blocks) return opt.num_blocks;
+  size_t recv_bytes = send_bytes * static_cast<size_t>(nranks);
+  return recv_bytes >= opt.split_threshold_recv_bytes ? opt.split_blocks : opt.num_blocks;
 }
 
 ncclSymkDevWorkArgs4K make_args(ncclDevComm_t dev_comm, ncclGinSyncHandle gin_sync,
@@ -197,7 +211,8 @@ std::vector<double> mean_samples_for_size(const std::vector<double>& all_samples
 }
 
 void print_metric_rows(const char* kind, const std::vector<double>& all_samples, size_t rank_chunk,
-                       const std::vector<size_t>& sizes, int iters, int nranks, int num_blocks,
+                       const std::vector<size_t>& sizes, const std::vector<int>& num_blocks_by_size, int iters,
+                       int nranks,
                        bool collective_stats) {
   for (size_t sidx = 0; sidx < sizes.size(); sidx++) {
     std::vector<double> samples = collective_stats
@@ -207,7 +222,7 @@ void print_metric_rows(const char* kind, const std::vector<double>& all_samples,
     double send_bw = gib_per_second(sizes[sidx], stats.p50);
     double recv_bw = gib_per_second(sizes[sidx] * static_cast<size_t>(nranks), stats.p50);
     std::printf("%s,%zu,%zu,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-                kind, sizes[sidx], sizes[sidx] * static_cast<size_t>(nranks), num_blocks,
+                kind, sizes[sidx], sizes[sidx] * static_cast<size_t>(nranks), num_blocks_by_size[sidx],
                 stats.min, stats.p50, stats.p90, stats.p99, stats.max, stats.avg, send_bw, recv_bw);
   }
 }
@@ -247,16 +262,25 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "Warning: rail team has one rank; GIN ring path will not exercise cross-node put.\n");
     }
 
+    std::vector<int> num_blocks_by_size;
+    num_blocks_by_size.reserve(sizes.size());
+    int max_launch_blocks = opt.num_blocks;
+    for (size_t size_bytes : sizes) {
+      int launch_blocks = launch_blocks_for_size(opt, size_bytes, nranks);
+      num_blocks_by_size.push_back(launch_blocks);
+      max_launch_blocks = std::max(max_launch_blocks, launch_blocks);
+    }
+
     ncclGinSyncHandle gin_sync = {};
     ncclDevResourceRequirements_t rail_signal_req = {};
-    rail_signal_req.ginSignalCount = rail.nRanks * opt.num_blocks;
+    rail_signal_req.ginSignalCount = rail.nRanks * max_launch_blocks;
     rail_signal_req.outGinSignalStart = &gin_sync.railSignals;
 
     ncclDevCommRequirements_t reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
     reqs.resourceRequirementsList = &rail_signal_req;
     reqs.lsaMultimem = true;
-    reqs.barrierCount = opt.num_blocks;
-    reqs.lsaBarrierCount = opt.num_blocks;
+    reqs.barrierCount = max_launch_blocks;
+    reqs.lsaBarrierCount = max_launch_blocks;
     reqs.ginContextCount = opt.gin_contexts;
     reqs.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
     reqs.ginQueueDepth = 0;
@@ -283,7 +307,7 @@ int main(int argc, char** argv) {
     NCCL_CHECK(ncclCommWindowRegister(comm, recvbuff, recv_bytes, &recv_win, NCCL_WIN_COLL_SYMMETRIC));
 
     uint64_t* d_body_samples = nullptr;
-    std::vector<uint64_t> h_body_samples(static_cast<size_t>(opt.iters) * opt.num_blocks);
+    std::vector<uint64_t> h_body_samples(static_cast<size_t>(opt.iters) * max_launch_blocks);
     CUDA_CHECK(cudaMalloc(&d_body_samples, h_body_samples.size() * sizeof(uint64_t)));
 
     std::vector<cudaEvent_t> event_start(opt.iters);
@@ -298,11 +322,13 @@ int main(int argc, char** argv) {
     local_kernel_samples.reserve(static_cast<size_t>(sizes.size()) * opt.iters);
     local_body_samples.reserve(static_cast<size_t>(sizes.size()) * opt.iters);
 
-    for (size_t size_bytes : sizes) {
-      ncclSymkDevWorkArgs4K args4k = make_args(dev_comm, gin_sync, send_win, recv_win, size_bytes, opt.num_blocks);
+    for (size_t sidx = 0; sidx < sizes.size(); sidx++) {
+      size_t size_bytes = sizes[sidx];
+      int launch_blocks = num_blocks_by_size[sidx];
+      ncclSymkDevWorkArgs4K args4k = make_args(dev_comm, gin_sync, send_win, recv_win, size_bytes, launch_blocks);
       CUDA_CHECK(cudaMemsetAsync(d_body_samples, 0, h_body_samples.size() * sizeof(uint64_t), stream));
       for (int i = 0; i < opt.warmup; i++) {
-        allgather_gin_bench_kernel<<<opt.num_blocks, opt.threads, 0, stream>>>(
+        allgather_gin_bench_kernel<<<launch_blocks, opt.threads, 0, stream>>>(
             args4k, nullptr, 0, opt.kernel_kind);
         CUDA_CHECK(cudaGetLastError());
       }
@@ -310,7 +336,7 @@ int main(int argc, char** argv) {
 
       for (int i = 0; i < opt.iters; i++) {
         CUDA_CHECK(cudaEventRecord(event_start[i], stream));
-        allgather_gin_bench_kernel<<<opt.num_blocks, opt.threads, 0, stream>>>(
+        allgather_gin_bench_kernel<<<launch_blocks, opt.threads, 0, stream>>>(
             args4k, d_body_samples, i, opt.kernel_kind);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaEventRecord(event_stop[i], stream));
@@ -328,8 +354,8 @@ int main(int argc, char** argv) {
         local_kernel_samples.push_back(static_cast<double>(elapsed_ms) * 1000.0);
 
         uint64_t max_cycles = 0;
-        for (int b = 0; b < opt.num_blocks; b++) {
-          max_cycles = std::max(max_cycles, h_body_samples[static_cast<size_t>(i) * opt.num_blocks + b]);
+        for (int b = 0; b < launch_blocks; b++) {
+          max_cycles = std::max(max_cycles, h_body_samples[static_cast<size_t>(i) * launch_blocks + b]);
         }
         local_body_samples.push_back(static_cast<double>(max_cycles) / opt.ticks_per_us);
       }
@@ -361,16 +387,18 @@ int main(int argc, char** argv) {
         std::exit(6);
       }
       std::printf("# allgather-gin-deviceapi-perf kernel=%s ranks=%d lsa_ranks=%d rail_ranks=%d threads=%d "
-                  "num_blocks=%d gin_contexts=%d warmup=%d iters=%d stats_mode=%s check=%s "
+                  "num_blocks=%d split_blocks=%d split_threshold_recv_B=%zu gin_contexts=%d warmup=%d iters=%d "
+                  "stats_mode=%s check=%s "
                   "ticks_per_us_rank0=%.3f\n",
-                  opt.kernel_name, nranks, lsa.nRanks, rail.nRanks, opt.threads, opt.num_blocks, opt.gin_contexts,
-                  opt.warmup, opt.iters, opt.collective_stats ? "collective_mean" : "rank",
+                  opt.kernel_name, nranks, lsa.nRanks, rail.nRanks, opt.threads, opt.num_blocks, opt.split_blocks,
+                  opt.split_threshold_recv_bytes, opt.gin_contexts, opt.warmup, opt.iters,
+                  opt.collective_stats ? "collective_mean" : "rank",
                   opt.check ? "passed" : "off", opt.ticks_per_us);
       std::printf("time_kind,send_B,recv_B,num_blocks,min_us,p50_us,p90_us,p99_us,max_us,avg_us,"
                   "send_bw_GBps,recv_bw_GBps\n");
-      print_metric_rows("kernel", all_kernel, rank_chunk, sizes, opt.iters, nranks, opt.num_blocks,
+      print_metric_rows("kernel", all_kernel, rank_chunk, sizes, num_blocks_by_size, opt.iters, nranks,
                         opt.collective_stats);
-      print_metric_rows("kernel_body", all_body, rank_chunk, sizes, opt.iters, nranks, opt.num_blocks,
+      print_metric_rows("kernel_body", all_body, rank_chunk, sizes, num_blocks_by_size, opt.iters, nranks,
                         opt.collective_stats);
     }
 
