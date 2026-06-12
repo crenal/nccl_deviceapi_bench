@@ -25,6 +25,10 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_OneshotRail_Timed(
   ncclBarrierSession<ncclCoopCta> bar(cta, ncclTeamTagWorld(), gin, blockIdx.x, /*multimem=*/true);
   int warpId = threadIdx.x / WARP_SIZE;
   int lane = threadIdx.x % WARP_SIZE;
+  int nWarps = blockDim.x / WARP_SIZE;
+  int sendWarpCount = rail.nRanks > 1 ? rail.nRanks - 1 : 0;
+  int bcastWarp0 = sendWarpCount;
+  int bcastWarpCount = nWarps - bcastWarp0;
 
   bar.sync(cta, cuda::memory_order_acquire, ncclGinFenceLevel::None);
   uint64_t bodyStart = 0;
@@ -32,26 +36,30 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_OneshotRail_Timed(
 
   handler.template forEachWorkNoFusion<uint8_t>([&] __device__(size_t nElts, size_t nAllElts, ncclSymPtr<uint8_t> input,
                                                                ncclSymPtr<uint8_t> output) {
-    if (warpId == 0) {
-      ncclCoopWarpSpan warps(0, 1, 0);
+    if (warpId < sendWarpCount) {
+      int remoteIdx = warpId;
+      int peer = remoteIdx >= rail.rank ? remoteIdx + 1 : remoteIdx;
+      ncclCoopWarpSpan warps(warpId, 1, warpId);
       int dgrank = ncclTeamRankToWorld(handler.comm, rail, rail.rank);
       size_t remainingElts = nElts;
       size_t offset = 0;
       while (remainingElts) {
         size_t chunkElts = min(remainingElts, size_t(chunkSize));
-        for (int peer = 0; peer < rail.nRanks; peer++) {
-          if (peer == rail.rank) continue;
-          gin.put(rail, peer, output + dgrank * nAllElts + offset, input + offset, chunkElts,
-                  ncclGin_SignalInc{railSignals + rail.rank}, ncclGin_None{}, warps);
-        }
+        gin.put(rail, peer, output + dgrank * nAllElts + offset, input + offset, chunkElts,
+                ncclGin_SignalInc{railSignals + rail.rank}, ncclGin_None{}, warps);
         offset += chunkElts;
         remainingElts -= chunkElts;
       }
       gin.flush(warps);
-    } else {
-      int dataPeer = warpId - 1;
-      if (dataPeer < rail.nRanks) {
-        ncclCoopWarpSpan warps(warpId, 1, warpId);
+    } else if (bcastWarpCount > 0) {
+      for (int dataPeer = 0; dataPeer < rail.nRanks; dataPeer++) {
+        int relStart = (dataPeer * bcastWarpCount) / rail.nRanks;
+        int relEnd = ((dataPeer + 1) * bcastWarpCount) / rail.nRanks;
+        int groupWarp0 = bcastWarp0 + relStart;
+        int groupWarps = relEnd - relStart;
+        if (groupWarps == 0 || warpId < groupWarp0 || warpId >= groupWarp0 + groupWarps) continue;
+
+        ncclCoopWarpSpan warps(groupWarp0, groupWarps, sendWarpCount + dataPeer);
         int dgrank = ncclTeamRankToWorld(handler.comm, rail, dataPeer);
         size_t remainingElts = nElts;
         size_t offset = 0;
@@ -79,6 +87,7 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_OneshotRail_Timed(
             *localSignalPtr = localSignalValue;
           }
         }
+        break;
       }
     }
   });
