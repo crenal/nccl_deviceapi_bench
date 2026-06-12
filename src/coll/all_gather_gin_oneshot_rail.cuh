@@ -52,7 +52,6 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_OneshotRail_Timed(
         offset += chunkElts;
         remainingElts -= chunkElts;
       }
-      gin.flush(warps);
     } else if (bcastWarpCount > 0) {
       for (int dataPeer = 0; dataPeer < rail.nRanks; dataPeer++) {
         int relStart = (dataPeer * bcastWarpCount) / rail.nRanks;
