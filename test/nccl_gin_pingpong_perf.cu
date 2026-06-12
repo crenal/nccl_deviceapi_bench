@@ -4,6 +4,7 @@
 #include <nccl_device.h>
 
 #include "common/checks.hpp"
+#include "common/csv.hpp"
 #include "common/mpi.hpp"
 #include "common/parse.hpp"
 #include "common/timer.cuh"
@@ -12,7 +13,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -193,16 +193,14 @@ static Options parse_args(int argc, char **argv) {
 
 static void write_csv(const std::string &path, int rank, const Options &opt,
                       const std::vector<Sample> &samples, double timer_ticks_per_us) {
-  std::ofstream out(path);
-  if (!out) {
-    throw std::runtime_error("failed to open csv: " + path);
-  }
-
-  out << "iter,rank,bytes,thread_group,timer_ticks_per_us,"
-      << "t0,t_after_put,t_after_quiet,t_after_signal,t_wait_done,"
-      << "put_issue_us,quiet_us,signal_us,wait_us,roundtrip_us,one_way_us,bw_p50_formula_gib_s\n";
+  CsvFile csv(path, 6);
+  std::ofstream &out = csv.stream();
 
   out << std::fixed << std::setprecision(6);
+  write_csv_row(out, "iter", "rank", "bytes", "thread_group", "timer_ticks_per_us",
+                "t0", "t_after_put", "t_after_quiet", "t_after_signal", "t_wait_done",
+                "put_issue_us", "quiet_us", "signal_us", "wait_us", "roundtrip_us",
+                "one_way_us", "bw_p50_formula_gib_s");
   for (int i = 0; i < static_cast<int>(samples.size()); ++i) {
     const Sample &s = samples[i];
     auto ticks_to_us = [&](uint64_t ticks) {
@@ -230,11 +228,9 @@ static void write_csv(const std::string &path, int rank, const Options &opt,
                           1000000.0
                     : 0.0;
 
-    out << i << "," << rank << "," << opt.bytes << ",warp," << timer_ticks_per_us << ","
-        << s.t0 << "," << s.t_after_put << "," << s.t_after_quiet << ","
-        << s.t_after_signal << "," << s.t_wait_done << "," << put_issue_us << ","
-        << quiet_us << "," << signal_us << "," << wait_us << "," << roundtrip_us << ","
-        << one_way_us << "," << bw << "\n";
+    write_csv_row(out, i, rank, opt.bytes, "warp", timer_ticks_per_us, s.t0, s.t_after_put,
+                  s.t_after_quiet, s.t_after_signal, s.t_wait_done, put_issue_us, quiet_us,
+                  signal_us, wait_us, roundtrip_us, one_way_us, bw);
   }
 }
 
@@ -251,17 +247,6 @@ static bool verify_rank0(char *recvbuf, size_t bytes) {
     }
   }
   return true;
-}
-
-static std::string rank_csv_path(std::string path, int rank, int nranks) {
-  if (nranks <= 1) {
-    return path;
-  }
-  std::string suffix = ".rank" + std::to_string(rank) + ".csv";
-  if (path.size() >= 4 && path.substr(path.size() - 4) == ".csv") {
-    return path.substr(0, path.size() - 4) + suffix;
-  }
-  return path + suffix;
 }
 
 }  // namespace

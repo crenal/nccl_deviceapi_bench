@@ -15,12 +15,12 @@ The benchmarks are intentionally small and do not modify NCCL. `barrier-test` an
 
 ```text
 src/common/                      shared parsing, checks, MPI, socket OOB, stats, and timer helpers
-src/nccl_gin_pingpong_perf.cu     two-rank GIN pingpong benchmark
-src/waitsignal_perf.cu            GIN waitSignal trace benchmark
-src/barrier_test.cu               GIN/world barrier benchmark
-src/bcast_multimem_test.cu        LSA bcastMultimem benchmark
 src/coll/all_gather_gin.cuh       ported NCCL AllGather_RailRing_LsaSTMC kernel
-src/allgather_gin_deviceapi_perf.cu  standalone AllGather GIN performance test
+test/nccl_gin_pingpong_perf.cu    two-rank GIN pingpong benchmark
+test/waitsignal_perf.cu           GIN waitSignal trace benchmark
+test/barrier_test.cu              GIN/world barrier benchmark
+test/bcast_multimem_test.cu       LSA bcastMultimem benchmark
+test/allgather_gin_deviceapi_perf.cu  standalone AllGather GIN performance test
 scripts/                          example launch scripts
 ```
 

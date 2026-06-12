@@ -77,28 +77,28 @@ function(configure_cuda_target target)
 endfunction()
 
 add_executable(nccl_gin_pingpong_perf
-  src/nccl_gin_pingpong_perf.cu)
+  test/nccl_gin_pingpong_perf.cu)
 configure_cuda_target(nccl_gin_pingpong_perf)
 target_link_libraries(nccl_gin_pingpong_perf PRIVATE MPI::MPI_CXX)
 
 add_executable(waitsignal_perf
-  src/waitsignal_perf.cu)
+  test/waitsignal_perf.cu)
 configure_cuda_target(waitsignal_perf)
 target_link_libraries(waitsignal_perf PRIVATE MPI::MPI_CXX)
 
 add_executable(barrier-test
-  src/barrier_test.cu)
+  test/barrier_test.cu)
 configure_cuda_target(barrier-test)
 
 add_executable(bcast-multimem-test
-  src/bcast_multimem_test.cu)
+  test/bcast_multimem_test.cu)
 configure_cuda_target(bcast-multimem-test)
 
 add_executable(bcast-multimem-8way-test
-  src/bcast_multimem_test.cu)
+  test/bcast_multimem_test.cu)
 configure_cuda_target(bcast-multimem-8way-test)
 target_compile_definitions(bcast-multimem-8way-test PRIVATE BCAST_MM_DEFAULT_COLLECTIVE_STATS=1)
 
 add_executable(allgather-gin-deviceapi-perf
-  src/allgather_gin_deviceapi_perf.cu)
+  test/allgather_gin_deviceapi_perf.cu)
 configure_cuda_target(allgather-gin-deviceapi-perf)

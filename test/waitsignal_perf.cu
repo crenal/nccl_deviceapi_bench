@@ -5,6 +5,7 @@
 #include <nccl_device.h>
 
 #include "common/checks.hpp"
+#include "common/csv.hpp"
 #include "common/mpi.hpp"
 #include "common/parse.hpp"
 #include "common/stats.hpp"
@@ -13,7 +14,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
-#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -140,26 +140,22 @@ static MetricStats compute_tick_stats(const std::vector<uint64_t> &ticks, double
   return stats;
 }
 
-static void write_raw_row(std::ofstream &csv, size_t iter, const char *metric,
+static void write_raw_row(std::ostream &csv, size_t iter, const char *metric,
                           uint64_t ticks, double ticks_per_us, const Sample &sample) {
-  csv << "raw," << iter << ',' << metric << ',' << ticks << ','
-      << ticks_to_us(ticks, ticks_per_us) << ",,,,,"
-      << sample.timestamps[kWaiterReady] << ','
-      << sample.timestamps[kSignalBefore] << ','
-      << sample.timestamps[kSignalAfter] << ','
-      << sample.timestamps[kWaitDone] << '\n';
+  write_csv_row(csv, "raw", iter, metric, ticks, ticks_to_us(ticks, ticks_per_us),
+                "", "", "", "", sample.timestamps[kWaiterReady],
+                sample.timestamps[kSignalBefore], sample.timestamps[kSignalAfter],
+                sample.timestamps[kWaitDone]);
 }
 
 static void write_csv(const std::string &path, const std::vector<Sample> &samples,
                       double ticks_per_us) {
-  std::ofstream csv(path);
-  if (!csv) {
-    throw std::runtime_error("failed to open csv output: " + path);
-  }
+  CsvFile csv_file(path, 10);
+  std::ofstream &csv = csv_file.stream();
 
-  csv << "row_type,iteration,metric,ticks,us,min_us,max_us,p50_us,p99_us,"
-      << "t_waiter_ready,t_signal_before,t_signal_after,t_wait_done\n";
-  csv << std::setprecision(10);
+  write_csv_row(csv, "row_type", "iteration", "metric", "ticks", "us", "min_us", "max_us",
+                "p50_us", "p99_us", "t_waiter_ready", "t_signal_before",
+                "t_signal_after", "t_wait_done");
 
   std::vector<uint64_t> local_atomic_add;
   std::vector<uint64_t> signal_to_wait_done;
@@ -181,8 +177,8 @@ static void write_csv(const std::string &path, const std::vector<Sample> &sample
   }
 
   auto write_summary = [&](const char *metric, const MetricStats &stats) {
-    csv << "summary,," << metric << ",,," << stats.min << ','
-        << stats.max << ',' << stats.p50 << ',' << stats.p99 << ",,,,\n";
+    write_csv_row(csv, "summary", "", metric, "", "", stats.min, stats.max, stats.p50,
+                  stats.p99, "", "", "", "");
   };
   write_summary("local_atomic_add", compute_tick_stats(local_atomic_add, ticks_per_us));
   write_summary("signal_to_wait_done", compute_tick_stats(signal_to_wait_done, ticks_per_us));
