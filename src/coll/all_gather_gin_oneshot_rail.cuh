@@ -18,7 +18,8 @@ __device__ __forceinline__ void ncclSymkAgOneshotRailPutSelfToPeer(ncclSymkArgsH
                                                                     ncclGin& gin, ncclGinSignal_t railSignals,
                                                                     int peer, int spanTag, size_t nElts,
                                                                     size_t nAllElts, ncclSymPtr<uint8_t> input,
-                                                                    ncclSymPtr<uint8_t> output) {
+                                                                    ncclSymPtr<uint8_t> output,
+                                                                    bool flushAfterPut) {
   constexpr int chunkSize = ncclSymkAllGather_RailRing_ChunkSize;
   ncclCoopWarpSpan warps(threadIdx.x / WARP_SIZE, 1, spanTag);
   int dgrank = ncclTeamRankToWorld(handler.comm, rail, rail.rank);
@@ -31,7 +32,9 @@ __device__ __forceinline__ void ncclSymkAgOneshotRailPutSelfToPeer(ncclSymkArgsH
     offset += chunkElts;
     remainingElts -= chunkElts;
   }
-  gin.flush(warps);
+  if (flushAfterPut) {
+    gin.flush(warps);
+  }
 }
 
 __device__ __forceinline__ void ncclSymkAgOneshotRailBcastDataPeer(ncclSymkArgsHandler& handler, ncclTeam rail,
@@ -87,7 +90,7 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_OneshotRail_SingleBlock(nc
       int remoteIdx = warpId;
       int peer = remoteIdx >= rail.rank ? remoteIdx + 1 : remoteIdx;
       ncclSymkAgOneshotRailPutSelfToPeer(handler, rail, gin, railSignals, peer, warpId, nElts, nAllElts, input,
-                                         output);
+                                         output, /*flushAfterPut=*/true);
     } else if (bcastWarpCount > 0) {
       for (int dataPeer = 0; dataPeer < rail.nRanks; dataPeer++) {
         int relStart = (dataPeer * bcastWarpCount) / rail.nRanks;
@@ -123,10 +126,10 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_OneshotRail_SharedSplit(nc
           int remoteIdx = warpId;
           int peer = remoteIdx >= rail.rank ? remoteIdx + 1 : remoteIdx;
           ncclSymkAgOneshotRailPutSelfToPeer(handler, rail, gin, railSignals, peer, warpId, nElts, nAllElts, input,
-                                             output);
+                                             output, /*flushAfterPut=*/false);
         }
 
-        int lsaWarp0 = blockIdx.x == 0 ? sendWarpCount : 0;
+        int lsaWarp0 = 0;
         int lsaWarpCount = nWarps - lsaWarp0;
         if (lsaWarpCount <= 0) return;
 
