@@ -31,6 +31,19 @@ enum AllGatherKernelKind {
   kOneshotRail = 1,
 };
 
+constexpr const char* kOneshotBreakdownMetricNames[ncclSymkAgOneshotBreakdownMetricCount] = {
+    "init_bar",
+    "work_total",
+    "send_put",
+    "send_flush",
+    "self_bcast",
+    "remote_wait",
+    "remote_bcast",
+    "shadow_update",
+    "final_bar",
+    "body_total",
+};
+
 struct Options {
   size_t min_bytes = 32ull << 10;
   size_t max_bytes = 8ull << 20;
@@ -153,9 +166,10 @@ ncclSymkDevWorkArgs4K make_args(ncclDevComm_t dev_comm, ncclGinSyncHandle gin_sy
 }
 
 __global__ void allgather_gin_bench_kernel(ncclSymkDevWorkArgs4K NCCL_GRID_CONSTANT const args4k,
-                                           uint64_t* body_samples, int sample_idx, int kernel_kind) {
+                                           uint64_t* body_samples, uint64_t* breakdown_samples, int sample_idx,
+                                           int kernel_kind) {
   if (kernel_kind == kOneshotRail) {
-    ncclSymkRun_AllGather_OneshotRail_Timed(&args4k.args, body_samples, sample_idx);
+    ncclSymkRun_AllGather_OneshotRail_Timed(&args4k.args, body_samples, breakdown_samples, sample_idx);
   } else {
     ncclSymkRun_AllGather_RailRing_LsaSTMC_Timed(&args4k.args, body_samples, sample_idx);
   }
@@ -209,6 +223,51 @@ void print_metric_rows(const char* kind, const std::vector<double>& all_samples,
     std::printf("%s,%zu,%zu,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
                 kind, sizes[sidx], sizes[sidx] * static_cast<size_t>(nranks), num_blocks,
                 stats.min, stats.p50, stats.p90, stats.p99, stats.max, stats.avg, send_bw, recv_bw);
+  }
+}
+
+std::vector<double> breakdown_samples_for_size_metric(const std::vector<double>& all_samples, size_t rank_chunk,
+                                                      size_t size_index, int metric, int metric_count, int iters,
+                                                      bool collective_mean) {
+  std::vector<double> samples;
+  if (collective_mean) {
+    samples.reserve(static_cast<size_t>(iters));
+    size_t nranks = rank_chunk == 0 ? 0 : all_samples.size() / rank_chunk;
+    for (int i = 0; i < iters; i++) {
+      double sum_us = 0.0;
+      for (size_t base = 0; base < all_samples.size(); base += rank_chunk) {
+        size_t off = base + (size_index * static_cast<size_t>(metric_count) + static_cast<size_t>(metric)) *
+                                static_cast<size_t>(iters) +
+                     static_cast<size_t>(i);
+        sum_us += all_samples[off];
+      }
+      samples.push_back(nranks == 0 ? 0.0 : sum_us / static_cast<double>(nranks));
+    }
+  } else {
+    size_t nranks = rank_chunk == 0 ? 0 : all_samples.size() / rank_chunk;
+    samples.reserve(nranks * static_cast<size_t>(iters));
+    for (size_t base = 0; base < all_samples.size(); base += rank_chunk) {
+      size_t off = base + (size_index * static_cast<size_t>(metric_count) + static_cast<size_t>(metric)) *
+                              static_cast<size_t>(iters);
+      samples.insert(samples.end(), all_samples.begin() + off, all_samples.begin() + off + iters);
+    }
+  }
+  return samples;
+}
+
+void print_breakdown_rows(const std::vector<double>& all_samples, size_t rank_chunk, const std::vector<size_t>& sizes,
+                          int iters, int nranks, int num_blocks, bool collective_stats) {
+  (void)nranks;
+  std::printf("breakdown_metric,send_B,recv_B,num_blocks,min_us,p50_us,p90_us,p99_us,max_us,avg_us\n");
+  for (size_t sidx = 0; sidx < sizes.size(); sidx++) {
+    for (int metric = 0; metric < ncclSymkAgOneshotBreakdownMetricCount; metric++) {
+      std::vector<double> samples = breakdown_samples_for_size_metric(
+          all_samples, rank_chunk, sidx, metric, ncclSymkAgOneshotBreakdownMetricCount, iters, collective_stats);
+      MetricStats stats = compute_stats(samples);
+      std::printf("%s,%zu,%zu,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                  kOneshotBreakdownMetricNames[metric], sizes[sidx], sizes[sidx] * static_cast<size_t>(nranks),
+                  num_blocks, stats.min, stats.p50, stats.p90, stats.p99, stats.max, stats.avg);
+    }
   }
 }
 
@@ -285,6 +344,12 @@ int main(int argc, char** argv) {
     uint64_t* d_body_samples = nullptr;
     std::vector<uint64_t> h_body_samples(static_cast<size_t>(opt.iters) * opt.num_blocks);
     CUDA_CHECK(cudaMalloc(&d_body_samples, h_body_samples.size() * sizeof(uint64_t)));
+    int n_warps = opt.threads / WARP_SIZE;
+    uint64_t* d_breakdown_samples = nullptr;
+    std::vector<uint64_t> h_breakdown_samples(static_cast<size_t>(opt.iters) * opt.num_blocks *
+                                              static_cast<size_t>(n_warps) *
+                                              ncclSymkAgOneshotBreakdownMetricCount);
+    CUDA_CHECK(cudaMalloc(&d_breakdown_samples, h_breakdown_samples.size() * sizeof(uint64_t)));
 
     std::vector<cudaEvent_t> event_start(opt.iters);
     std::vector<cudaEvent_t> event_stop(opt.iters);
@@ -295,15 +360,21 @@ int main(int argc, char** argv) {
 
     std::vector<double> local_kernel_samples;
     std::vector<double> local_body_samples;
+    std::vector<double> local_breakdown_samples;
     local_kernel_samples.reserve(static_cast<size_t>(sizes.size()) * opt.iters);
     local_body_samples.reserve(static_cast<size_t>(sizes.size()) * opt.iters);
+    if (opt.kernel_kind == kOneshotRail) {
+      local_breakdown_samples.reserve(static_cast<size_t>(sizes.size()) * ncclSymkAgOneshotBreakdownMetricCount *
+                                      opt.iters);
+    }
 
     for (size_t size_bytes : sizes) {
       ncclSymkDevWorkArgs4K args4k = make_args(dev_comm, gin_sync, send_win, recv_win, size_bytes, opt.num_blocks);
       CUDA_CHECK(cudaMemsetAsync(d_body_samples, 0, h_body_samples.size() * sizeof(uint64_t), stream));
+      CUDA_CHECK(cudaMemsetAsync(d_breakdown_samples, 0, h_breakdown_samples.size() * sizeof(uint64_t), stream));
       for (int i = 0; i < opt.warmup; i++) {
         allgather_gin_bench_kernel<<<opt.num_blocks, opt.threads, 0, stream>>>(
-            args4k, nullptr, 0, opt.kernel_kind);
+            args4k, nullptr, nullptr, 0, opt.kernel_kind);
         CUDA_CHECK(cudaGetLastError());
       }
       CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -311,12 +382,17 @@ int main(int argc, char** argv) {
       for (int i = 0; i < opt.iters; i++) {
         CUDA_CHECK(cudaEventRecord(event_start[i], stream));
         allgather_gin_bench_kernel<<<opt.num_blocks, opt.threads, 0, stream>>>(
-            args4k, d_body_samples, i, opt.kernel_kind);
+            args4k, d_body_samples, opt.kernel_kind == kOneshotRail ? d_breakdown_samples : nullptr, i,
+            opt.kernel_kind);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaEventRecord(event_stop[i], stream));
       }
       CUDA_CHECK(cudaMemcpyAsync(h_body_samples.data(), d_body_samples, h_body_samples.size() * sizeof(uint64_t),
                                  cudaMemcpyDeviceToHost, stream));
+      if (opt.kernel_kind == kOneshotRail) {
+        CUDA_CHECK(cudaMemcpyAsync(h_breakdown_samples.data(), d_breakdown_samples,
+                                   h_breakdown_samples.size() * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream));
+      }
       CUDA_CHECK(cudaStreamSynchronize(stream));
       if (opt.check) {
         check_allgather_result(recvbuff, stream, size_bytes, rank, nranks);
@@ -333,6 +409,24 @@ int main(int argc, char** argv) {
         }
         local_body_samples.push_back(static_cast<double>(max_cycles) / opt.ticks_per_us);
       }
+      if (opt.kernel_kind == kOneshotRail) {
+        for (int metric = 0; metric < ncclSymkAgOneshotBreakdownMetricCount; metric++) {
+          for (int i = 0; i < opt.iters; i++) {
+            uint64_t max_cycles = 0;
+            for (int b = 0; b < opt.num_blocks; b++) {
+              for (int w = 0; w < n_warps; w++) {
+                size_t idx = (((static_cast<size_t>(i) * opt.num_blocks + static_cast<size_t>(b)) *
+                                   static_cast<size_t>(n_warps) +
+                               static_cast<size_t>(w)) *
+                                  ncclSymkAgOneshotBreakdownMetricCount) +
+                             static_cast<size_t>(metric);
+                max_cycles = std::max(max_cycles, h_breakdown_samples[idx]);
+              }
+            }
+            local_breakdown_samples.push_back(static_cast<double>(max_cycles) / opt.ticks_per_us);
+          }
+        }
+      }
     }
 
     for (int i = 0; i < opt.iters; i++) {
@@ -340,6 +434,7 @@ int main(int argc, char** argv) {
       CUDA_CHECK(cudaEventDestroy(event_stop[i]));
     }
     CUDA_CHECK(cudaFree(d_body_samples));
+    CUDA_CHECK(cudaFree(d_breakdown_samples));
     NCCL_CHECK(ncclCommWindowDeregister(comm, send_win));
     NCCL_CHECK(ncclCommWindowDeregister(comm, recv_win));
     NCCL_CHECK(ncclMemFree(sendbuff));
@@ -352,6 +447,8 @@ int main(int argc, char** argv) {
         gather_samples_socket(rank, nranks, opt.master_addr, opt.port + 1, local_kernel_samples);
     std::vector<double> all_body =
         gather_samples_socket(rank, nranks, opt.master_addr, opt.port + 2, local_body_samples);
+    std::vector<double> all_breakdown =
+        gather_samples_socket(rank, nranks, opt.master_addr, opt.port + 3, local_breakdown_samples);
 
     if (rank == 0) {
       size_t rank_chunk = static_cast<size_t>(sizes.size()) * opt.iters;
@@ -372,6 +469,19 @@ int main(int argc, char** argv) {
                         opt.collective_stats);
       print_metric_rows("kernel_body", all_body, rank_chunk, sizes, opt.iters, nranks, opt.num_blocks,
                         opt.collective_stats);
+      if (opt.kernel_kind == kOneshotRail) {
+        size_t breakdown_rank_chunk =
+            static_cast<size_t>(sizes.size()) * ncclSymkAgOneshotBreakdownMetricCount * opt.iters;
+        if (breakdown_rank_chunk == 0 || all_breakdown.size() % breakdown_rank_chunk != 0) {
+          std::fprintf(stderr, "Unexpected gathered breakdown sample count: breakdown=%zu rankChunk=%zu\n",
+                       all_breakdown.size(), breakdown_rank_chunk);
+          std::exit(6);
+        }
+        std::printf("# breakdown stats: per-rank max over blocks/warps for each metric, then %s over ranks\n",
+                    opt.collective_stats ? "mean" : "all rank samples");
+        print_breakdown_rows(all_breakdown, breakdown_rank_chunk, sizes, opt.iters, nranks, opt.num_blocks,
+                             opt.collective_stats);
+      }
     }
 
     return 0;
