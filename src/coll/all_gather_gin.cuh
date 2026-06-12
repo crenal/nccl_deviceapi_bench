@@ -10,7 +10,17 @@
 #include "primitives.cuh"
 #include "gin_scratch__types.h"
 
-__device__ __forceinline__ void ncclSymkRun_AllGather_RailRing_LsaSTMC(struct ncclSymkDevWorkArgs const* args) {
+#ifndef NCCL_DEVICEAPI_TEST_SYMK_GLOBAL_TIMER_DEFINED
+#define NCCL_DEVICEAPI_TEST_SYMK_GLOBAL_TIMER_DEFINED
+__device__ __forceinline__ uint64_t ncclSymkReadGlobalTimer() {
+  uint64_t timer;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(timer));
+  return timer;
+}
+#endif
+
+__device__ __forceinline__ void ncclSymkRun_AllGather_RailRing_LsaSTMC_Timed(
+    struct ncclSymkDevWorkArgs const* args, uint64_t* bodySamples, int sampleIdx) {
   ncclCoopCta cta;
   ncclSymkArgsHandler handler(args);
   ncclTeam rail = ncclTeamRail(handler.comm);
@@ -25,6 +35,8 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_RailRing_LsaSTMC(struct nc
   const int ringThreads = WARP_SIZE;
 
   bar.sync(cta, cuda::memory_order_acquire, ncclGinFenceLevel::None);
+  uint64_t bodyStart = 0;
+  if (threadIdx.x == 0 && bodySamples != nullptr) bodyStart = ncclSymkReadGlobalTimer();
 
   handler.template forEachWorkNoFusion<uint8_t>([&] __device__(size_t nElts, size_t nAllElts, ncclSymPtr<uint8_t> input,
                                                                ncclSymPtr<uint8_t> output) {
@@ -97,4 +109,11 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_RailRing_LsaSTMC(struct nc
     *localSignalPtr = localSignalValue;
   }
   bar.sync(cta, cuda::memory_order_release, ncclGinFenceLevel::None);
+  if (threadIdx.x == 0 && bodySamples != nullptr) {
+    bodySamples[static_cast<size_t>(sampleIdx) * gridDim.x + blockIdx.x] = ncclSymkReadGlobalTimer() - bodyStart;
+  }
+}
+
+__device__ __forceinline__ void ncclSymkRun_AllGather_RailRing_LsaSTMC(struct ncclSymkDevWorkArgs const* args) {
+  ncclSymkRun_AllGather_RailRing_LsaSTMC_Timed(args, nullptr, 0);
 }
