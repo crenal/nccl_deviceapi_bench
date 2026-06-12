@@ -40,7 +40,11 @@ constexpr const char* kOneshotBreakdownMetricNames[ncclSymkAgOneshotBreakdownMet
     "remote_wait",
     "remote_bcast",
     "shadow_update",
-    "final_bar",
+    "final_bar_all",
+    "final_bar_send_wait",
+    "final_bar_lsa_wait",
+    "final_bar_self_lsa_wait",
+    "final_bar_remote_lsa_wait",
     "body_total",
 };
 

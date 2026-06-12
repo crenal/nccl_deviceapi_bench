@@ -23,9 +23,13 @@ enum NcclSymkAgOneshotBreakdownMetric {
   ncclSymkAgOneshotBreakdownRemoteWait = 5,
   ncclSymkAgOneshotBreakdownRemoteBcast = 6,
   ncclSymkAgOneshotBreakdownShadowUpdate = 7,
-  ncclSymkAgOneshotBreakdownFinalBar = 8,
-  ncclSymkAgOneshotBreakdownBodyTotal = 9,
-  ncclSymkAgOneshotBreakdownMetricCount = 10,
+  ncclSymkAgOneshotBreakdownFinalBarAll = 8,
+  ncclSymkAgOneshotBreakdownFinalBarSendWait = 9,
+  ncclSymkAgOneshotBreakdownFinalBarLsaWait = 10,
+  ncclSymkAgOneshotBreakdownFinalBarSelfLsaWait = 11,
+  ncclSymkAgOneshotBreakdownFinalBarRemoteLsaWait = 12,
+  ncclSymkAgOneshotBreakdownBodyTotal = 13,
+  ncclSymkAgOneshotBreakdownMetricCount = 14,
 };
 
 __device__ __forceinline__ void ncclSymkRecordAgOneshotBreakdown(
@@ -75,6 +79,7 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_OneshotRail_Timed(
   uint64_t remoteWaitTicks = 0;
   uint64_t remoteBcastTicks = 0;
   uint64_t shadowUpdateTicks = 0;
+  int bcastDataPeer = -1;
   if (breakdownSamples != nullptr && lane == 0) workStart = ncclSymkReadGlobalTimer();
 
   handler.template forEachWorkNoFusion<uint8_t>([&] __device__(size_t nElts, size_t nAllElts, ncclSymPtr<uint8_t> input,
@@ -107,6 +112,7 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_OneshotRail_Timed(
         int groupWarp0 = bcastWarp0 + relStart;
         int groupWarps = relEnd - relStart;
         if (groupWarps == 0 || warpId < groupWarp0 || warpId >= groupWarp0 + groupWarps) continue;
+        bcastDataPeer = dataPeer;
 
         ncclCoopWarpSpan warps(groupWarp0, groupWarps, sendWarpCount + dataPeer);
         int dgrank = ncclTeamRankToWorld(handler.comm, rail, dataPeer);
@@ -174,8 +180,23 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_OneshotRail_Timed(
   if (breakdownSamples != nullptr && lane == 0) finalBarStart = ncclSymkReadGlobalTimer();
   finalLsaBar.sync(cta, cuda::memory_order_release);
   if (breakdownSamples != nullptr && lane == 0) {
-    ncclSymkRecordAgOneshotBreakdown(breakdownSamples, sampleIdx, warpId, ncclSymkAgOneshotBreakdownFinalBar,
-                                     ncclSymkReadGlobalTimer() - finalBarStart);
+    uint64_t finalBarTicks = ncclSymkReadGlobalTimer() - finalBarStart;
+    ncclSymkRecordAgOneshotBreakdown(breakdownSamples, sampleIdx, warpId, ncclSymkAgOneshotBreakdownFinalBarAll,
+                                     finalBarTicks);
+    if (warpId < sendWarpCount) {
+      ncclSymkRecordAgOneshotBreakdown(breakdownSamples, sampleIdx, warpId,
+                                       ncclSymkAgOneshotBreakdownFinalBarSendWait, finalBarTicks);
+    } else if (warpId >= bcastWarp0 && warpId < bcastWarp0 + bcastWarpCount) {
+      ncclSymkRecordAgOneshotBreakdown(breakdownSamples, sampleIdx, warpId,
+                                       ncclSymkAgOneshotBreakdownFinalBarLsaWait, finalBarTicks);
+      if (bcastDataPeer == rail.rank) {
+        ncclSymkRecordAgOneshotBreakdown(breakdownSamples, sampleIdx, warpId,
+                                         ncclSymkAgOneshotBreakdownFinalBarSelfLsaWait, finalBarTicks);
+      } else if (bcastDataPeer >= 0) {
+        ncclSymkRecordAgOneshotBreakdown(breakdownSamples, sampleIdx, warpId,
+                                         ncclSymkAgOneshotBreakdownFinalBarRemoteLsaWait, finalBarTicks);
+      }
+    }
     ncclSymkRecordAgOneshotBreakdown(breakdownSamples, sampleIdx, warpId, ncclSymkAgOneshotBreakdownBodyTotal,
                                      ncclSymkReadGlobalTimer() - bodyStartWarp);
   }
