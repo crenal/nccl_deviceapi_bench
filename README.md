@@ -6,6 +6,7 @@ This repository collects the standalone NCCL device API microbenchmarks used for
 - `waitsignal_perf`: same-GPU GIN signal wait latency trace.
 - `barrier-test`: NCCL device API barrier latency.
 - `bcast-multimem-test`: `bcastMultimem<char, false>()` LSA/multimem broadcast benchmark.
+- `bcast-multimem-8way-test`: 8-rank simultaneous `bcastMultimem` benchmark with collective-level timing.
 
 The benchmarks are intentionally small and do not modify NCCL. `barrier-test` and `bcast-multimem-test` include NCCL private symmetric headers, so they require an NCCL source tree in addition to an NCCL build/install tree.
 
@@ -126,6 +127,28 @@ mpirun --allow-run-as-root -np 8 --map-by ppr:8:node \
 ```
 
 Use `--num-blocks N` to control how many CTAs split and execute one bcast. For `N > 1`, each CTA records its local elapsed cycles and the host reports the per-iteration max across CTAs.
+
+The default `bcast-multimem-test` reports the distribution of per-rank samples. To measure the single-node 8-rank simultaneous operation as one collective, use `bcast-multimem-8way-test` or pass `--stats-mode collective`:
+
+```bash
+mpirun --allow-run-as-root -np 8 --map-by ppr:8:node \
+  -x LD_LIBRARY_PATH \
+  -x BCAST_MM_MASTER_ADDR -x BCAST_MM_MASTER_PORT \
+  ./build/bcast-multimem-8way-test \
+    --min-bytes 64 \
+    --max-bytes 512M \
+    --factor 2 \
+    --warmup 100 \
+    --iters 1000 \
+    --threads 512 \
+    --num-blocks 1
+```
+
+The 8-way output uses the max rank time for each iteration and prints:
+
+- `per_rank_inj_bw_GBps = size_B / p50_us`
+- `aggregate_inj_bw_GBps = per_rank_inj_bw_GBps * lsa_ranks`
+- `aggregate_delivered_bw_GBps = aggregate_inj_bw_GBps * lsa_ranks`
 
 ## Notes
 

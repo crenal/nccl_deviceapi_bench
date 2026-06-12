@@ -91,3 +91,8 @@ configure_cuda_target(barrier-test)
 add_executable(bcast-multimem-test
   src/bcast_multimem_test.cu)
 configure_cuda_target(bcast-multimem-test)
+
+add_executable(bcast-multimem-8way-test
+  src/bcast_multimem_test.cu)
+configure_cuda_target(bcast-multimem-8way-test)
+target_compile_definitions(bcast-multimem-8way-test PRIVATE BCAST_MM_DEFAULT_COLLECTIVE_STATS=1)

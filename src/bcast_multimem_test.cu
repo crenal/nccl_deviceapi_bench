@@ -35,13 +35,19 @@ struct Options {
   int port = 22340;
   double ticks_per_us = 0.0;
   std::string master_addr;
+#if defined(BCAST_MM_DEFAULT_COLLECTIVE_STATS)
+  bool collective_stats = true;
+#else
+  bool collective_stats = false;
+#endif
 };
 
 void usage(const char* argv0) {
   std::fprintf(stderr,
       "Usage: %s [--min-bytes N] [--max-bytes N] [--factor N]\n"
       "          [--warmup N] [--iters N] [--threads N] [--num-blocks N]\n"
-      "          [--device ID] [--master ADDR] [--port PORT] [--ticks-per-us X]\n",
+      "          [--device ID] [--master ADDR] [--port PORT] [--ticks-per-us X]\n"
+      "          [--stats-mode rank|collective]\n",
       argv0);
 }
 
@@ -81,6 +87,19 @@ Options parse_args(int argc, char** argv) {
       opt.port = std::atoi(need(argv[i]));
     } else if (std::strcmp(argv[i], "--ticks-per-us") == 0) {
       opt.ticks_per_us = std::atof(need(argv[i]));
+    } else if (std::strcmp(argv[i], "--stats-mode") == 0) {
+      const char* mode = need(argv[i]);
+      if (std::strcmp(mode, "rank") == 0) {
+        opt.collective_stats = false;
+      } else if (std::strcmp(mode, "collective") == 0) {
+        opt.collective_stats = true;
+      } else {
+        std::fprintf(stderr, "Unknown --stats-mode: %s\n", mode);
+        usage(argv[0]);
+        std::exit(3);
+      }
+    } else if (std::strcmp(argv[i], "--collective-stats") == 0) {
+      opt.collective_stats = true;
     } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
       usage(argv[0]);
       std::exit(0);
@@ -282,25 +301,51 @@ int main(int argc, char** argv) {
         std::exit(6);
       }
       std::printf("# bcast-multimem-test ranks=%d lsa_ranks=%d threads=%d num_blocks=%d warmup=%d iters=%d "
-                  "ticks_per_us_rank0=%.3f\n",
-                  nranks, lsa_ranks, opt.threads, opt.num_blocks, opt.warmup, opt.iters, opt.ticks_per_us);
-      std::printf("size_B,num_blocks,min_us,p50_us,p90_us,p99_us,max_us,inj_bw_GBps,delivered_bw_GBps\n");
+                  "stats_mode=%s ticks_per_us_rank0=%.3f\n",
+                  nranks, lsa_ranks, opt.threads, opt.num_blocks, opt.warmup, opt.iters,
+                  opt.collective_stats ? "collective" : "rank", opt.ticks_per_us);
+      if (opt.collective_stats) {
+        std::printf("size_B,num_blocks,min_us,p50_us,p90_us,p99_us,max_us,"
+                    "per_rank_inj_bw_GBps,aggregate_inj_bw_GBps,aggregate_delivered_bw_GBps\n");
+      } else {
+        std::printf("size_B,num_blocks,min_us,p50_us,p90_us,p99_us,max_us,inj_bw_GBps,delivered_bw_GBps\n");
+      }
       for (size_t sidx = 0; sidx < sizes.size(); sidx++) {
         std::vector<double> samples;
-        samples.reserve(static_cast<size_t>(nranks) * opt.iters);
-        for (size_t base = 0; base < all.size(); base += rank_chunk) {
-          size_t off = base + sidx * static_cast<size_t>(opt.iters);
-          samples.insert(samples.end(), all.begin() + off, all.begin() + off + opt.iters);
+        if (opt.collective_stats) {
+          samples.reserve(static_cast<size_t>(opt.iters));
+          for (int i = 0; i < opt.iters; i++) {
+            double max_us = 0.0;
+            for (size_t base = 0; base < all.size(); base += rank_chunk) {
+              size_t off = base + sidx * static_cast<size_t>(opt.iters) + static_cast<size_t>(i);
+              max_us = std::max(max_us, all[off]);
+            }
+            samples.push_back(max_us);
+          }
+        } else {
+          samples.reserve(static_cast<size_t>(nranks) * opt.iters);
+          for (size_t base = 0; base < all.size(); base += rank_chunk) {
+            size_t off = base + sidx * static_cast<size_t>(opt.iters);
+            samples.insert(samples.end(), all.begin() + off, all.begin() + off + opt.iters);
+          }
         }
         MetricStats stats = compute_stats(samples);
-        double inj_bw = stats.p50 > 0.0
-                            ? (static_cast<double>(sizes[sidx]) / (1024.0 * 1024.0 * 1024.0)) /
-                                  (stats.p50 * 1.0e-6)
-                            : 0.0;
-        double delivered_bw = inj_bw * static_cast<double>(lsa_ranks);
-        std::printf("%zu,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-                    sizes[sidx], opt.num_blocks, stats.min, stats.p50, stats.p90, stats.p99, stats.max,
-                    inj_bw, delivered_bw);
+        double per_rank_inj_bw = stats.p50 > 0.0
+                                     ? (static_cast<double>(sizes[sidx]) / (1024.0 * 1024.0 * 1024.0)) /
+                                           (stats.p50 * 1.0e-6)
+                                     : 0.0;
+        if (opt.collective_stats) {
+          double aggregate_inj_bw = per_rank_inj_bw * static_cast<double>(lsa_ranks);
+          double aggregate_delivered_bw = aggregate_inj_bw * static_cast<double>(lsa_ranks);
+          std::printf("%zu,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                      sizes[sidx], opt.num_blocks, stats.min, stats.p50, stats.p90, stats.p99, stats.max,
+                      per_rank_inj_bw, aggregate_inj_bw, aggregate_delivered_bw);
+        } else {
+          double delivered_bw = per_rank_inj_bw * static_cast<double>(lsa_ranks);
+          std::printf("%zu,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                      sizes[sidx], opt.num_blocks, stats.min, stats.p50, stats.p90, stats.p99, stats.max,
+                      per_rank_inj_bw, delivered_bw);
+        }
       }
     }
 
