@@ -1,0 +1,9 @@
+build/
+results/
+*.log
+*.csv
+*.rank*.csv
+*.nsys-rep
+*.sqlite
+__pycache__/
+.DS_Store
