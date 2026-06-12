@@ -7,6 +7,7 @@ This repository collects the standalone NCCL device API microbenchmarks used for
 - `barrier-test`: NCCL device API barrier latency.
 - `bcast-multimem-test`: `bcastMultimem<char, false>()` LSA/multimem broadcast benchmark.
 - `bcast-multimem-8way-test`: 8-rank simultaneous `bcastMultimem` benchmark with collective-level timing.
+- `allgather-gin-deviceapi-perf`: standalone benchmark for the ported `AllGather_RailRing_LsaSTMC` kernel.
 
 The benchmarks are intentionally small and do not modify NCCL. `barrier-test` and `bcast-multimem-test` include NCCL private symmetric headers, so they require an NCCL source tree in addition to an NCCL build/install tree.
 
@@ -18,6 +19,8 @@ src/nccl_gin_pingpong_perf.cu     two-rank GIN pingpong benchmark
 src/waitsignal_perf.cu            GIN waitSignal trace benchmark
 src/barrier_test.cu               GIN/world barrier benchmark
 src/bcast_multimem_test.cu        LSA bcastMultimem benchmark
+src/coll/all_gather_gin.cuh       ported NCCL AllGather_RailRing_LsaSTMC kernel
+src/allgather_gin_deviceapi_perf.cu  standalone AllGather GIN performance test
 scripts/                          example launch scripts
 ```
 
@@ -149,6 +152,33 @@ The 8-way output uses the max rank time for each iteration and prints:
 - `per_rank_inj_bw_GBps = size_B / p50_us`
 - `aggregate_inj_bw_GBps = per_rank_inj_bw_GBps * lsa_ranks`
 - `aggregate_delivered_bw_GBps = aggregate_inj_bw_GBps * lsa_ranks`
+
+### AllGather GIN device API test
+
+This benchmark launches the ported `src/coll/all_gather_gin.cuh` implementation directly. It allocates symmetric send/recv windows, creates a rail GIN device communicator, and reports kernel-side timing.
+
+```bash
+export AG_GIN_MASTER_ADDR=2605:340:cd51:4900:476c:99af:d4df:a32b
+export AG_GIN_MASTER_PORT=22540
+export NCCL_GIN_TYPE=3
+
+mpirun --allow-run-as-root -np 32 \
+  --hostfile /opt/tiger/github-latest-20260611/hostfile.4n \
+  --map-by ppr:8:node --mca routed direct \
+  -x LD_LIBRARY_PATH -x NCCL_IB_HCA -x NCCL_GIN_TYPE \
+  -x AG_GIN_MASTER_ADDR -x AG_GIN_MASTER_PORT \
+  ./build/allgather-gin-deviceapi-perf \
+    --min-bytes 32K \
+    --max-bytes 8M \
+    --factor 2 \
+    --warmup 100 \
+    --iters 1000 \
+    --threads 512 \
+    --num-blocks 1 \
+    --stats-mode collective
+```
+
+`send_B` is the per-rank input size. `recv_B` is the per-rank allgather receive size, `send_B * ranks`. In `collective` stats mode each iteration first takes the max CTA time per rank and then the max rank time across all ranks.
 
 ## Notes
 

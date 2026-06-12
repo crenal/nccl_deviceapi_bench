@@ -53,11 +53,13 @@ endif()
 set(NCCL_PRIVATE_INCLUDE_DIRS
   "${NCCL_SOURCE_DIR}/src/include"
   "${NCCL_SOURCE_DIR}/src/include/plugin"
+  "${NCCL_SOURCE_DIR}/src/device/symmetric"
   "${NCCL_SOURCE_DIR}/src")
 
 set(COMMON_CUDA_OPTIONS
   --extended-lambda
-  --expt-relaxed-constexpr)
+  --expt-relaxed-constexpr
+  -Xptxas=-maxrregcount=96)
 
 function(configure_cuda_target target)
   target_include_directories(${target} PRIVATE
@@ -96,3 +98,7 @@ add_executable(bcast-multimem-8way-test
   src/bcast_multimem_test.cu)
 configure_cuda_target(bcast-multimem-8way-test)
 target_compile_definitions(bcast-multimem-8way-test PRIVATE BCAST_MM_DEFAULT_COLLECTIVE_STATS=1)
+
+add_executable(allgather-gin-deviceapi-perf
+  src/allgather_gin_deviceapi_perf.cu)
+configure_cuda_target(allgather-gin-deviceapi-perf)
