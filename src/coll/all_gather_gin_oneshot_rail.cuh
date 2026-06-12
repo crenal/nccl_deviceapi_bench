@@ -54,40 +54,45 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_OneshotRail_Timed(
       }
       gin.flush(warps);
     } else if (bcastWarpCount > 0) {
-      for (int dataPeer = 0; dataPeer < rail.nRanks; dataPeer++) {
-        int relStart = (dataPeer * bcastWarpCount) / rail.nRanks;
-        int relEnd = ((dataPeer + 1) * bcastWarpCount) / rail.nRanks;
+      int selfDgRank = ncclTeamRankToWorld(handler.comm, rail, rail.rank);
+      ncclCoopWarpSpan selfWarps(bcastWarp0, bcastWarpCount, sendWarpCount + rail.rank);
+      size_t selfRemainingElts = nElts;
+      size_t selfOffset = 0;
+      while (selfRemainingElts) {
+        size_t chunkElts = min(selfRemainingElts, size_t(chunkSize));
+        bcastMultimem(handler, selfWarps.num_threads(), selfWarps.thread_rank(), input + selfOffset,
+                      output + selfDgRank * nAllElts + selfOffset, chunkElts);
+        selfOffset += chunkElts;
+        selfRemainingElts -= chunkElts;
+      }
+
+      int remoteCount = rail.nRanks > 1 ? rail.nRanks - 1 : 0;
+      for (int remoteOrdinal = 0; remoteOrdinal < remoteCount; remoteOrdinal++) {
+        int relStart = (remoteOrdinal * bcastWarpCount) / remoteCount;
+        int relEnd = ((remoteOrdinal + 1) * bcastWarpCount) / remoteCount;
         int groupWarp0 = bcastWarp0 + relStart;
         int groupWarps = relEnd - relStart;
         if (groupWarps == 0 || warpId < groupWarp0 || warpId >= groupWarp0 + groupWarps) continue;
 
+        int dataPeer = remoteOrdinal >= rail.rank ? remoteOrdinal + 1 : remoteOrdinal;
         ncclCoopWarpSpan warps(groupWarp0, groupWarps, sendWarpCount + dataPeer);
         int dgrank = ncclTeamRankToWorld(handler.comm, rail, dataPeer);
         size_t remainingElts = nElts;
         size_t offset = 0;
-        if (dataPeer == rail.rank) {
-          while (remainingElts) {
-            size_t chunkElts = min(remainingElts, size_t(chunkSize));
-            bcastMultimem(handler, warps.num_threads(), warps.thread_rank(), input + offset,
-                          output + dgrank * nAllElts + offset, chunkElts);
-            offset += chunkElts;
-            remainingElts -= chunkElts;
-          }
-        } else {
-          uint64_t* localSignalPtr = gin.getSignalShadowPtr(railSignals + dataPeer);
-          uint64_t localSignalValue = *localSignalPtr;
-          while (remainingElts) {
-            size_t chunkElts = min(remainingElts, size_t(chunkSize));
-            gin.waitSignal(warps, railSignals + dataPeer, localSignalValue + 1, 32);
-            bcastMultimem(handler, warps.num_threads(), warps.thread_rank(),
-                          output + dgrank * nAllElts + offset, output + dgrank * nAllElts + offset, chunkElts);
-            offset += chunkElts;
-            remainingElts -= chunkElts;
-            localSignalValue++;
-          }
-          if (lane == 0) {
-            *localSignalPtr = localSignalValue;
-          }
+
+        uint64_t* localSignalPtr = gin.getSignalShadowPtr(railSignals + dataPeer);
+        uint64_t localSignalValue = *localSignalPtr;
+        while (remainingElts) {
+          size_t chunkElts = min(remainingElts, size_t(chunkSize));
+          gin.waitSignal(warps, railSignals + dataPeer, localSignalValue + 1, 32);
+          bcastMultimem(handler, warps.num_threads(), warps.thread_rank(),
+                        output + dgrank * nAllElts + offset, output + dgrank * nAllElts + offset, chunkElts);
+          offset += chunkElts;
+          remainingElts -= chunkElts;
+          localSignalValue++;
+        }
+        if (lane == 0) {
+          *localSignalPtr = localSignalValue;
         }
         break;
       }
