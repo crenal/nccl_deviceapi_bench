@@ -22,7 +22,9 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_OneshotRail_Timed(
   ncclGin gin(handler.comm, (int)(blockIdx.x % handler.comm.ginContextCount));
   constexpr int chunkSize = ncclSymkAllGather_RailRing_ChunkSize;
   ncclGinSignal_t railSignals = handler.ginSyncHandle.railSignals + blockIdx.x * rail.nRanks;
-  ncclBarrierSession<ncclCoopCta> bar(cta, ncclTeamTagWorld(), gin, blockIdx.x, /*multimem=*/true);
+  ncclBarrierSession<ncclCoopCta> worldBar(cta, ncclTeamTagWorld(), gin, blockIdx.x, /*multimem=*/true);
+  ncclLsaBarrierSession<ncclCoopCta> finalLsaBar(cta, handler.comm, ncclTeamTagLsa(), blockIdx.x,
+                                                 /*multimem=*/true);
   int warpId = threadIdx.x / WARP_SIZE;
   int lane = threadIdx.x % WARP_SIZE;
   int nWarps = blockDim.x / WARP_SIZE;
@@ -30,7 +32,7 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_OneshotRail_Timed(
   int bcastWarp0 = sendWarpCount;
   int bcastWarpCount = nWarps - bcastWarp0;
 
-  bar.sync(cta, cuda::memory_order_acquire, ncclGinFenceLevel::None);
+  worldBar.sync(cta, cuda::memory_order_acquire, ncclGinFenceLevel::None);
   uint64_t bodyStart = 0;
   if (threadIdx.x == 0 && bodySamples != nullptr) bodyStart = ncclSymkReadGlobalTimer();
 
@@ -92,7 +94,7 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_OneshotRail_Timed(
     }
   });
 
-  bar.sync(cta, cuda::memory_order_release, ncclGinFenceLevel::None);
+  finalLsaBar.sync(cta, cuda::memory_order_release);
   if (threadIdx.x == 0 && bodySamples != nullptr) {
     bodySamples[static_cast<size_t>(sampleIdx) * gridDim.x + blockIdx.x] = ncclSymkReadGlobalTimer() - bodyStart;
   }

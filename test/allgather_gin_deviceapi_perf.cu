@@ -15,6 +15,7 @@
 #include "common/timer.cuh"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -43,6 +44,7 @@ struct Options {
   int port = 22540;
   double ticks_per_us = 0.0;
   bool collective_stats = true;
+  bool check = false;
   int kernel_kind = kRailRing;
   const char* kernel_name = "railring";
   std::string master_addr;
@@ -54,7 +56,7 @@ void usage(const char* argv0) {
       "          [--warmup N] [--iters N] [--threads N] [--num-blocks N]\n"
       "          [--gin-contexts N] [--device ID] [--master ADDR] [--port PORT]\n"
       "          [--ticks-per-us X] [--stats-mode rank|collective]\n"
-      "          [--kernel railring|oneshot-rail]\n",
+      "          [--kernel railring|oneshot-rail] [--check]\n",
       argv0);
 }
 
@@ -120,6 +122,8 @@ Options parse_args(int argc, char** argv) {
         usage(argv[0]);
         std::exit(3);
       }
+    } else if (std::strcmp(argv[i], "--check") == 0) {
+      opt.check = true;
     } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
       usage(argv[0]);
       std::exit(0);
@@ -154,6 +158,25 @@ __global__ void allgather_gin_bench_kernel(ncclSymkDevWorkArgs4K NCCL_GRID_CONST
     ncclSymkRun_AllGather_OneshotRail_Timed(&args4k.args, body_samples, sample_idx);
   } else {
     ncclSymkRun_AllGather_RailRing_LsaSTMC_Timed(&args4k.args, body_samples, sample_idx);
+  }
+}
+
+void check_allgather_result(void* recvbuff, cudaStream_t stream, size_t size_bytes, int rank, int nranks) {
+  std::vector<uint8_t> h_recv(size_bytes * static_cast<size_t>(nranks));
+  CUDA_CHECK(cudaMemcpyAsync(h_recv.data(), recvbuff, h_recv.size(), cudaMemcpyDeviceToHost, stream));
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+  for (int peer = 0; peer < nranks; peer++) {
+    uint8_t expected = static_cast<uint8_t>(peer & 0xff);
+    size_t base = static_cast<size_t>(peer) * size_bytes;
+    for (size_t i = 0; i < size_bytes; i++) {
+      uint8_t got = h_recv[base + i];
+      if (got != expected) {
+        std::fprintf(stderr,
+                     "Rank %d check failed: send_B=%zu peer=%d offset=%zu got=%u expected=%u\n",
+                     rank, size_bytes, peer, i, static_cast<unsigned>(got), static_cast<unsigned>(expected));
+        std::exit(7);
+      }
+    }
   }
 }
 
@@ -233,6 +256,7 @@ int main(int argc, char** argv) {
     reqs.resourceRequirementsList = &rail_signal_req;
     reqs.lsaMultimem = true;
     reqs.barrierCount = opt.num_blocks;
+    reqs.lsaBarrierCount = opt.num_blocks;
     reqs.ginContextCount = opt.gin_contexts;
     reqs.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
     reqs.ginQueueDepth = 0;
@@ -294,6 +318,9 @@ int main(int argc, char** argv) {
       CUDA_CHECK(cudaMemcpyAsync(h_body_samples.data(), d_body_samples, h_body_samples.size() * sizeof(uint64_t),
                                  cudaMemcpyDeviceToHost, stream));
       CUDA_CHECK(cudaStreamSynchronize(stream));
+      if (opt.check) {
+        check_allgather_result(recvbuff, stream, size_bytes, rank, nranks);
+      }
 
       for (int i = 0; i < opt.iters; i++) {
         float elapsed_ms = 0.0f;
@@ -334,9 +361,11 @@ int main(int argc, char** argv) {
         std::exit(6);
       }
       std::printf("# allgather-gin-deviceapi-perf kernel=%s ranks=%d lsa_ranks=%d rail_ranks=%d threads=%d "
-                  "num_blocks=%d gin_contexts=%d warmup=%d iters=%d stats_mode=%s ticks_per_us_rank0=%.3f\n",
+                  "num_blocks=%d gin_contexts=%d warmup=%d iters=%d stats_mode=%s check=%s "
+                  "ticks_per_us_rank0=%.3f\n",
                   opt.kernel_name, nranks, lsa.nRanks, rail.nRanks, opt.threads, opt.num_blocks, opt.gin_contexts,
-                  opt.warmup, opt.iters, opt.collective_stats ? "collective_mean" : "rank", opt.ticks_per_us);
+                  opt.warmup, opt.iters, opt.collective_stats ? "collective_mean" : "rank",
+                  opt.check ? "passed" : "off", opt.ticks_per_us);
       std::printf("time_kind,send_B,recv_B,num_blocks,min_us,p50_us,p90_us,p99_us,max_us,avg_us,"
                   "send_bw_GBps,recv_bw_GBps\n");
       print_metric_rows("kernel", all_kernel, rank_chunk, sizes, opt.iters, nranks, opt.num_blocks,
