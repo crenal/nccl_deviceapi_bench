@@ -7,7 +7,8 @@ This repository collects the standalone NCCL device API microbenchmarks used for
 - `barrier-test`: NCCL device API barrier latency.
 - `bcast-multimem-test`: `bcastMultimem<char, false>()` LSA/multimem broadcast benchmark.
 - `bcast-multimem-8way-test`: 8-rank simultaneous `bcastMultimem` benchmark with collective-level timing.
-- `allgather-gin-deviceapi-perf`: standalone benchmark for the ported `AllGather_RailRing_LsaSTMC` kernel.
+- `allgather-gin-deviceapi-perf`: standalone benchmark for the ported `AllGather_RailRing_LsaSTMC`
+  kernel and the experimental `oneshot-rail` GIN/LSA AllGather variants.
 
 The benchmarks are intentionally small and do not modify NCCL. `barrier-test` and `bcast-multimem-test` include NCCL private symmetric headers, so they require an NCCL source tree in addition to an NCCL build/install tree.
 
@@ -155,7 +156,16 @@ The 8-way output uses the max rank time for each iteration and prints:
 
 ### AllGather GIN device API test
 
-This benchmark launches the ported `src/coll/all_gather_gin.cuh` implementation directly. It allocates symmetric send/recv windows, creates a rail GIN device communicator, and reports kernel-side timing.
+This benchmark launches AllGather kernels directly from NCCL device API building blocks. It allocates symmetric send/recv windows, creates a rail GIN device communicator, and reports both CUDA event kernel time and kernel-body time measured inside the device kernel.
+
+Use `--kernel railring` for the ported `AllGather_RailRing_LsaSTMC` implementation in `src/coll/all_gather_gin.cuh`.
+
+Use `--kernel oneshot-rail` for the optimized experimental implementation in `src/coll/all_gather_gin_oneshot_rail.cuh`. The default script runs this path. Its default policy is:
+
+- `--num-blocks 1`: small messages use the original one-CTA logic.
+- `--split-threshold 4M`: threshold is based on `recv_B`, not `send_B`.
+- `--split-blocks 4`: when `recv_B >= 4M`, launch four CTAs.
+- In the split path, block0 issues the cross-rail GIN puts, does not call `gin.flush()`, and then all warps in each CTA participate in the LSA `bcastMultimem` stage.
 
 ```bash
 export AG_GIN_MASTER_ADDR=2605:340:cd51:4900:476c:99af:d4df:a32b
@@ -168,6 +178,7 @@ mpirun --allow-run-as-root -np 32 \
   -x LD_LIBRARY_PATH -x NCCL_IB_HCA -x NCCL_GIN_TYPE \
   -x AG_GIN_MASTER_ADDR -x AG_GIN_MASTER_PORT \
   ./build/allgather-gin-deviceapi-perf \
+    --kernel oneshot-rail \
     --min-bytes 32K \
     --max-bytes 8M \
     --factor 2 \
@@ -175,10 +186,27 @@ mpirun --allow-run-as-root -np 32 \
     --iters 1000 \
     --threads 512 \
     --num-blocks 1 \
+    --split-blocks 4 \
+    --split-threshold 4M \
     --stats-mode collective
 ```
 
 `send_B` is the per-rank input size. `recv_B` is the per-rank allgather receive size, `send_B * ranks`. In `collective` stats mode each iteration first takes the max CTA time per rank and then the max rank time across all ranks.
+
+The same run can be launched through the script:
+
+```bash
+NCCL_GIN_TYPE=3 CHECK=1 scripts/run_allgather_gin_deviceapi_4n.sh
+```
+
+Useful overrides:
+
+```bash
+MIN_BYTES=1K MAX_BYTES=256K WARMUP=20 ITERS=1000 CHECK=1 scripts/run_allgather_gin_deviceapi_4n.sh
+KERNEL=railring scripts/run_allgather_gin_deviceapi_4n.sh
+SPLIT_BLOCKS=1 scripts/run_allgather_gin_deviceapi_4n.sh   # force one-CTA baseline
+SPLIT_THRESHOLD=8M scripts/run_allgather_gin_deviceapi_4n.sh
+```
 
 ## Notes
 
