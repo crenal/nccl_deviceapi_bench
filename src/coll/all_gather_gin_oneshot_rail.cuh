@@ -55,10 +55,28 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_OneshotRail_Timed(
       gin.flush(warps);
     } else if (bcastWarpCount > 0) {
       for (int dataPeer = 0; dataPeer < rail.nRanks; dataPeer++) {
-        int relStart = (dataPeer * bcastWarpCount) / rail.nRanks;
-        int relEnd = ((dataPeer + 1) * bcastWarpCount) / rail.nRanks;
-        int groupWarp0 = bcastWarp0 + relStart;
-        int groupWarps = relEnd - relStart;
+        int groupWarp0 = bcastWarp0;
+        int groupWarps = 0;
+        if (rail.nRanks > 1 && bcastWarpCount >= rail.nRanks) {
+          int selfWarps = min(3, bcastWarpCount - (rail.nRanks - 1));
+          if (dataPeer == rail.rank) {
+            groupWarp0 = bcastWarp0;
+            groupWarps = selfWarps;
+          } else {
+            int remoteOrdinal = dataPeer < rail.rank ? dataPeer : dataPeer - 1;
+            int remoteWarp0 = bcastWarp0 + selfWarps;
+            int remoteWarpCount = bcastWarpCount - selfWarps;
+            int relStart = (remoteOrdinal * remoteWarpCount) / (rail.nRanks - 1);
+            int relEnd = ((remoteOrdinal + 1) * remoteWarpCount) / (rail.nRanks - 1);
+            groupWarp0 = remoteWarp0 + relStart;
+            groupWarps = relEnd - relStart;
+          }
+        } else {
+          int relStart = (dataPeer * bcastWarpCount) / rail.nRanks;
+          int relEnd = ((dataPeer + 1) * bcastWarpCount) / rail.nRanks;
+          groupWarp0 = bcastWarp0 + relStart;
+          groupWarps = relEnd - relStart;
+        }
         if (groupWarps == 0 || warpId < groupWarp0 || warpId >= groupWarp0 + groupWarps) continue;
 
         ncclCoopWarpSpan warps(groupWarp0, groupWarps, sendWarpCount + dataPeer);
