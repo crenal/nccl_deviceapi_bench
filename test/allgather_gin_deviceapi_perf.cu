@@ -12,7 +12,6 @@
 #include "common/stats.hpp"
 #include "common/symk.hpp"
 #include "common/sweep.hpp"
-#include "common/timer.cuh"
 
 #include <algorithm>
 #include <cstdint>
@@ -44,7 +43,6 @@ struct Options {
   int gin_contexts = 4;
   int device = -1;
   int port = 22540;
-  double ticks_per_us = 0.0;
   bool collective_stats = true;
   bool check = false;
   int kernel_kind = kRailRing;
@@ -58,7 +56,7 @@ void usage(const char* argv0) {
       "          [--warmup N] [--iters N] [--threads N] [--num-blocks N]\n"
       "          [--split-blocks N] [--split-threshold N]\n"
       "          [--gin-contexts N] [--device ID] [--master ADDR] [--port PORT]\n"
-      "          [--ticks-per-us X] [--stats-mode rank|collective]\n"
+      "          [--stats-mode rank|collective]\n"
       "          [--kernel railring|oneshot-rail] [--check]\n",
       argv0);
 }
@@ -103,8 +101,6 @@ Options parse_args(int argc, char** argv) {
       opt.master_addr = need(argv[i]);
     } else if (std::strcmp(argv[i], "--port") == 0) {
       opt.port = std::atoi(need(argv[i]));
-    } else if (std::strcmp(argv[i], "--ticks-per-us") == 0) {
-      opt.ticks_per_us = std::atof(need(argv[i]));
     } else if (std::strcmp(argv[i], "--stats-mode") == 0) {
       const char* mode = need(argv[i]);
       if (std::strcmp(mode, "rank") == 0) {
@@ -145,7 +141,7 @@ Options parse_args(int argc, char** argv) {
       opt.warmup < 0 || opt.iters <= 0 || opt.threads <= WARP_SIZE || opt.threads > 1024 ||
       (opt.threads % WARP_SIZE) != 0 || opt.num_blocks <= 0 || opt.num_blocks > ncclSymkMaxBlocks ||
       opt.split_blocks <= 0 || opt.split_blocks > ncclSymkMaxBlocks ||
-      opt.gin_contexts <= 0 || opt.port <= 0 || opt.ticks_per_us < 0.0) {
+      opt.gin_contexts <= 0 || opt.port <= 0) {
     std::fprintf(stderr, "Invalid arguments\n");
     std::exit(3);
   }
@@ -167,11 +163,13 @@ ncclSymkDevWorkArgs4K make_args(ncclDevComm_t dev_comm, ncclGinSyncHandle gin_sy
 }
 
 __global__ void allgather_gin_bench_kernel(ncclSymkDevWorkArgs4K NCCL_GRID_CONSTANT const args4k,
-                                           uint64_t* body_samples, int sample_idx, int kernel_kind) {
-  if (kernel_kind == kOneshotRail) {
-    ncclSymkRun_AllGather_OneshotRail_Timed(&args4k.args, body_samples, sample_idx);
-  } else {
-    ncclSymkRun_AllGather_RailRing_LsaSTMC_Timed(&args4k.args, body_samples, sample_idx);
+                                           int loop_iters, int kernel_kind) {
+  for (int i = 0; i < loop_iters; i++) {
+    if (kernel_kind == kOneshotRail) {
+      ncclSymkRun_AllGather_OneshotRail(&args4k.args);
+    } else {
+      ncclSymkRun_AllGather_RailRing_LsaSTMC(&args4k.args);
+    }
   }
 }
 
@@ -195,14 +193,14 @@ void check_allgather_result(void* recvbuff, cudaStream_t stream, size_t size_byt
 }
 
 std::vector<double> mean_samples_for_size(const std::vector<double>& all_samples, size_t rank_chunk,
-                                          size_t size_index, int iters) {
+                                          size_t size_index, int samples_per_size) {
   std::vector<double> samples;
-  samples.reserve(static_cast<size_t>(iters));
+  samples.reserve(static_cast<size_t>(samples_per_size));
   size_t nranks = rank_chunk == 0 ? 0 : all_samples.size() / rank_chunk;
-  for (int i = 0; i < iters; i++) {
+  for (int i = 0; i < samples_per_size; i++) {
     double sum_us = 0.0;
     for (size_t base = 0; base < all_samples.size(); base += rank_chunk) {
-      size_t off = base + size_index * static_cast<size_t>(iters) + static_cast<size_t>(i);
+      size_t off = base + size_index * static_cast<size_t>(samples_per_size) + static_cast<size_t>(i);
       sum_us += all_samples[off];
     }
     samples.push_back(nranks == 0 ? 0.0 : sum_us / static_cast<double>(nranks));
@@ -211,13 +209,13 @@ std::vector<double> mean_samples_for_size(const std::vector<double>& all_samples
 }
 
 void print_metric_rows(const char* kind, const std::vector<double>& all_samples, size_t rank_chunk,
-                       const std::vector<size_t>& sizes, const std::vector<int>& num_blocks_by_size, int iters,
-                       int nranks,
+                       const std::vector<size_t>& sizes, const std::vector<int>& num_blocks_by_size,
+                       int samples_per_size, int nranks,
                        bool collective_stats) {
   for (size_t sidx = 0; sidx < sizes.size(); sidx++) {
     std::vector<double> samples = collective_stats
-                                      ? mean_samples_for_size(all_samples, rank_chunk, sidx, iters)
-                                      : samples_for_size(all_samples, rank_chunk, sidx, iters, false);
+                                      ? mean_samples_for_size(all_samples, rank_chunk, sidx, samples_per_size)
+                                      : samples_for_size(all_samples, rank_chunk, sidx, samples_per_size, false);
     MetricStats stats = compute_stats(samples);
     double send_bw = gib_per_second(sizes[sidx], stats.p50);
     double recv_bw = gib_per_second(sizes[sidx] * static_cast<size_t>(nranks), stats.p50);
@@ -242,7 +240,6 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaGetDeviceCount(&ndev));
     int device = opt.device >= 0 ? opt.device : (local_rank % std::max(1, ndev));
     CUDA_CHECK(cudaSetDevice(device));
-    if (opt.ticks_per_us == 0.0) opt.ticks_per_us = calibrate_ticks_per_us();
 
     ncclUniqueId id = exchange_unique_id_socket(rank, nranks, opt.master_addr, opt.port);
 
@@ -306,66 +303,43 @@ int main(int argc, char** argv) {
     NCCL_CHECK(ncclCommWindowRegister(comm, sendbuff, send_bytes, &send_win, NCCL_WIN_COLL_SYMMETRIC));
     NCCL_CHECK(ncclCommWindowRegister(comm, recvbuff, recv_bytes, &recv_win, NCCL_WIN_COLL_SYMMETRIC));
 
-    uint64_t* d_body_samples = nullptr;
-    std::vector<uint64_t> h_body_samples(static_cast<size_t>(opt.iters) * max_launch_blocks);
-    CUDA_CHECK(cudaMalloc(&d_body_samples, h_body_samples.size() * sizeof(uint64_t)));
-
-    std::vector<cudaEvent_t> event_start(opt.iters);
-    std::vector<cudaEvent_t> event_stop(opt.iters);
-    for (int i = 0; i < opt.iters; i++) {
-      CUDA_CHECK(cudaEventCreate(&event_start[i]));
-      CUDA_CHECK(cudaEventCreate(&event_stop[i]));
-    }
+    cudaEvent_t event_start;
+    cudaEvent_t event_stop;
+    CUDA_CHECK(cudaEventCreate(&event_start));
+    CUDA_CHECK(cudaEventCreate(&event_stop));
 
     std::vector<double> local_kernel_samples;
-    std::vector<double> local_body_samples;
-    local_kernel_samples.reserve(static_cast<size_t>(sizes.size()) * opt.iters);
-    local_body_samples.reserve(static_cast<size_t>(sizes.size()) * opt.iters);
+    constexpr int samples_per_size = 1;
+    local_kernel_samples.reserve(sizes.size());
 
     for (size_t sidx = 0; sidx < sizes.size(); sidx++) {
       size_t size_bytes = sizes[sidx];
       int launch_blocks = num_blocks_by_size[sidx];
       ncclSymkDevWorkArgs4K args4k = make_args(dev_comm, gin_sync, send_win, recv_win, size_bytes, launch_blocks);
-      CUDA_CHECK(cudaMemsetAsync(d_body_samples, 0, h_body_samples.size() * sizeof(uint64_t), stream));
-      for (int i = 0; i < opt.warmup; i++) {
+      if (opt.warmup > 0) {
         allgather_gin_bench_kernel<<<launch_blocks, opt.threads, 0, stream>>>(
-            args4k, nullptr, 0, opt.kernel_kind);
+            args4k, opt.warmup, opt.kernel_kind);
         CUDA_CHECK(cudaGetLastError());
       }
       CUDA_CHECK(cudaStreamSynchronize(stream));
 
-      for (int i = 0; i < opt.iters; i++) {
-        CUDA_CHECK(cudaEventRecord(event_start[i], stream));
-        allgather_gin_bench_kernel<<<launch_blocks, opt.threads, 0, stream>>>(
-            args4k, d_body_samples, i, opt.kernel_kind);
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaEventRecord(event_stop[i], stream));
-      }
-      CUDA_CHECK(cudaMemcpyAsync(h_body_samples.data(), d_body_samples, h_body_samples.size() * sizeof(uint64_t),
-                                 cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaEventRecord(event_start, stream));
+      allgather_gin_bench_kernel<<<launch_blocks, opt.threads, 0, stream>>>(
+          args4k, opt.iters, opt.kernel_kind);
+      CUDA_CHECK(cudaGetLastError());
+      CUDA_CHECK(cudaEventRecord(event_stop, stream));
       CUDA_CHECK(cudaStreamSynchronize(stream));
       if (opt.check) {
         check_allgather_result(recvbuff, stream, size_bytes, rank, nranks);
       }
 
-      for (int i = 0; i < opt.iters; i++) {
-        float elapsed_ms = 0.0f;
-        CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, event_start[i], event_stop[i]));
-        local_kernel_samples.push_back(static_cast<double>(elapsed_ms) * 1000.0);
-
-        uint64_t max_cycles = 0;
-        for (int b = 0; b < launch_blocks; b++) {
-          max_cycles = std::max(max_cycles, h_body_samples[static_cast<size_t>(i) * launch_blocks + b]);
-        }
-        local_body_samples.push_back(static_cast<double>(max_cycles) / opt.ticks_per_us);
-      }
+      float elapsed_ms = 0.0f;
+      CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, event_start, event_stop));
+      local_kernel_samples.push_back(static_cast<double>(elapsed_ms) * 1000.0 / static_cast<double>(opt.iters));
     }
 
-    for (int i = 0; i < opt.iters; i++) {
-      CUDA_CHECK(cudaEventDestroy(event_start[i]));
-      CUDA_CHECK(cudaEventDestroy(event_stop[i]));
-    }
-    CUDA_CHECK(cudaFree(d_body_samples));
+    CUDA_CHECK(cudaEventDestroy(event_start));
+    CUDA_CHECK(cudaEventDestroy(event_stop));
     NCCL_CHECK(ncclCommWindowDeregister(comm, send_win));
     NCCL_CHECK(ncclCommWindowDeregister(comm, recv_win));
     NCCL_CHECK(ncclMemFree(sendbuff));
@@ -376,29 +350,24 @@ int main(int argc, char** argv) {
 
     std::vector<double> all_kernel =
         gather_samples_socket(rank, nranks, opt.master_addr, opt.port + 1, local_kernel_samples);
-    std::vector<double> all_body =
-        gather_samples_socket(rank, nranks, opt.master_addr, opt.port + 2, local_body_samples);
 
     if (rank == 0) {
-      size_t rank_chunk = static_cast<size_t>(sizes.size()) * opt.iters;
-      if (rank_chunk == 0 || all_kernel.size() % rank_chunk != 0 || all_body.size() % rank_chunk != 0) {
-        std::fprintf(stderr, "Unexpected gathered sample count: kernel=%zu body=%zu rankChunk=%zu\n",
-                     all_kernel.size(), all_body.size(), rank_chunk);
+      size_t rank_chunk = static_cast<size_t>(sizes.size()) * samples_per_size;
+      if (rank_chunk == 0 || all_kernel.size() % rank_chunk != 0) {
+        std::fprintf(stderr, "Unexpected gathered sample count: kernel=%zu rankChunk=%zu\n",
+                     all_kernel.size(), rank_chunk);
         std::exit(6);
       }
       std::printf("# allgather-gin-deviceapi-perf kernel=%s ranks=%d lsa_ranks=%d rail_ranks=%d threads=%d "
                   "num_blocks=%d split_blocks=%d split_threshold_recv_B=%zu gin_contexts=%d warmup=%d iters=%d "
-                  "stats_mode=%s check=%s "
-                  "ticks_per_us_rank0=%.3f\n",
+                  "timing=single_kernel_event_div_iters samples_per_size=%d stats_mode=%s check=%s\n",
                   opt.kernel_name, nranks, lsa.nRanks, rail.nRanks, opt.threads, opt.num_blocks, opt.split_blocks,
                   opt.split_threshold_recv_bytes, opt.gin_contexts, opt.warmup, opt.iters,
-                  opt.collective_stats ? "collective_mean" : "rank",
-                  opt.check ? "passed" : "off", opt.ticks_per_us);
+                  samples_per_size, opt.collective_stats ? "collective_mean" : "rank",
+                  opt.check ? "passed" : "off");
       std::printf("time_kind,send_B,recv_B,num_blocks,min_us,p50_us,p90_us,p99_us,max_us,avg_us,"
                   "send_bw_GBps,recv_bw_GBps\n");
-      print_metric_rows("kernel", all_kernel, rank_chunk, sizes, num_blocks_by_size, opt.iters, nranks,
-                        opt.collective_stats);
-      print_metric_rows("kernel_body", all_body, rank_chunk, sizes, num_blocks_by_size, opt.iters, nranks,
+      print_metric_rows("kernel_loop_event", all_kernel, rank_chunk, sizes, num_blocks_by_size, samples_per_size, nranks,
                         opt.collective_stats);
     }
 

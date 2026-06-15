@@ -148,6 +148,11 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_OneshotRail_SharedSplit(nc
           break;
         }
       });
+
+  if (blockIdx.x == 0 && warpId < sendWarpCount) {
+    ncclCoopWarpSpan warps(warpId, 1, warpId);
+    gin.flush(warps);
+  }
 }
 
 __device__ __forceinline__ bool ncclSymkUseAllGatherOneshotRailSharedSplit(ncclTeam rail) {

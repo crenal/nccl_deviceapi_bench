@@ -156,7 +156,7 @@ The 8-way output uses the max rank time for each iteration and prints:
 
 ### AllGather GIN device API test
 
-This benchmark launches AllGather kernels directly from NCCL device API building blocks. It allocates symmetric send/recv windows, creates a rail GIN device communicator, and reports both CUDA event kernel time and kernel-body time measured inside the device kernel.
+This benchmark launches AllGather kernels directly from NCCL device API building blocks. It allocates symmetric send/recv windows, creates a rail GIN device communicator, and reports CUDA event time using one measured kernel per size. The measured kernel loops over `--iters` AllGather operations internally, and the reported time is `event_elapsed / iters`.
 
 Use `--kernel railring` for the ported `AllGather_RailRing_LsaSTMC` implementation in `src/coll/all_gather_gin.cuh`.
 
@@ -165,7 +165,7 @@ Use `--kernel oneshot-rail` for the optimized experimental implementation in `sr
 - `--num-blocks 1`: small messages use the original one-CTA logic.
 - `--split-threshold 4M`: threshold is based on `recv_B`, not `send_B`.
 - `--split-blocks 4`: when `recv_B >= 4M`, launch four CTAs.
-- In the split path, block0 issues the cross-rail GIN puts, does not call `gin.flush()`, and then all warps in each CTA participate in the LSA `bcastMultimem` stage.
+- In the split path, block0 issues the cross-rail GIN puts without an immediate flush, all warps in each CTA participate in the LSA `bcastMultimem` stage, and the put warps flush before the final barrier so one in-kernel iteration does not carry GIN queue pressure into the next iteration.
 
 ```bash
 export AG_GIN_MASTER_ADDR=2605:340:cd51:4900:476c:99af:d4df:a32b
@@ -191,7 +191,7 @@ mpirun --allow-run-as-root -np 32 \
     --stats-mode collective
 ```
 
-`send_B` is the per-rank input size. `recv_B` is the per-rank allgather receive size, `send_B * ranks`. In `collective` stats mode each iteration first takes the max CTA time per rank and then the max rank time across all ranks.
+`send_B` is the per-rank input size. `recv_B` is the per-rank allgather receive size, `send_B * ranks`. The output row `kernel_loop_event` is the single measured kernel event time divided by `--iters`. In `collective` stats mode the printed value is the mean of the per-rank `event_elapsed / iters` values; in `rank` mode it summarizes the per-rank values.
 
 The same run can be launched through the script:
 
