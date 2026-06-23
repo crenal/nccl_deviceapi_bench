@@ -81,6 +81,11 @@ add_executable(nccl_gin_pingpong_perf
 configure_cuda_target(nccl_gin_pingpong_perf)
 target_link_libraries(nccl_gin_pingpong_perf PRIVATE MPI::MPI_CXX)
 
+add_executable(gin_put_signal_visibility
+  test/gin_put_signal_visibility.cu)
+configure_cuda_target(gin_put_signal_visibility)
+target_link_libraries(gin_put_signal_visibility PRIVATE MPI::MPI_CXX)
+
 add_executable(waitsignal_perf
   test/waitsignal_perf.cu)
 configure_cuda_target(waitsignal_perf)

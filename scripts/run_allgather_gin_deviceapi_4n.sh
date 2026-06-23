@@ -23,6 +23,7 @@ ARGS=(
   --split-blocks "${SPLIT_BLOCKS:-4}"
   --split-threshold "${SPLIT_THRESHOLD:-4M}"
   --gin-contexts "${GIN_CONTEXTS:-4}"
+  --gin-flush "${GIN_FLUSH:-0}"
   --stats-mode "${STATS_MODE:-collective}"
 )
 

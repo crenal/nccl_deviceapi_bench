@@ -3,6 +3,7 @@
 This repository collects the standalone NCCL device API microbenchmarks used for GIN/LSA experiments:
 
 - `nccl_gin_pingpong_perf`: two-rank GIN pingpong latency.
+- `gin_put_signal_visibility`: two-rank GIN put-with-signal visibility check.
 - `waitsignal_perf`: same-GPU GIN signal wait latency trace.
 - `barrier-test`: NCCL device API barrier latency.
 - `bcast-multimem-test`: `bcastMultimem<char, false>()` LSA/multimem broadcast benchmark.
@@ -18,6 +19,7 @@ The benchmarks are intentionally small and do not modify NCCL. `barrier-test` an
 src/common/                      shared parsing, checks, MPI, socket OOB, stats, and timer helpers
 src/coll/all_gather_gin.cuh       ported NCCL AllGather_RailRing_LsaSTMC kernel
 test/nccl_gin_pingpong_perf.cu    two-rank GIN pingpong benchmark
+test/gin_put_signal_visibility.cu two-rank GIN put-with-signal visibility check
 test/waitsignal_perf.cu           GIN waitSignal trace benchmark
 test/barrier_test.cu              GIN/world barrier benchmark
 test/bcast_multimem_test.cu       LSA bcastMultimem benchmark
@@ -66,6 +68,26 @@ mpirun --allow-run-as-root -np 2 --hostfile hostfile \
 ```
 
 The program writes one CSV per rank, for example `pingpong_1KB.rank0.csv`.
+
+### GIN put-with-signal visibility
+
+This mirrors the NVSHMEM `putmem_signal_nbi_block` visibility repro: rank 0 writes a round-specific payload into
+`src`, issues one GIN `put(..., SignalInc)` into rank 1's `dst`, and rank 1 immediately reads `dst` after
+`waitSignal` returns. The sender only calls `gin.flush()` after the receiver-side check, so a failure means the
+signal became visible before the payload was safely readable.
+
+```bash
+mpirun --allow-run-as-root -np 2 --hostfile hostfile \
+  --mca routed direct --map-by slot \
+  -x PATH -x LD_LIBRARY_PATH \
+  -x CUDA_VISIBLE_DEVICES \
+  -x NCCL_IB_HCA=mlx5_1 \
+  -x NCCL_GIN_TYPE=3 \
+  -x CUDA_DEVICE_MAX_CONNECTIONS=1 \
+  ./build/gin_put_signal_visibility \
+    --bytes 128K \
+    --iters 10000
+```
 
 ### waitSignal trace
 
@@ -164,8 +186,9 @@ Use `--kernel oneshot-rail` for the optimized experimental implementation in `sr
 
 - `--num-blocks 1`: small messages use the original one-CTA logic.
 - `--split-threshold 4M`: threshold is based on `recv_B`, not `send_B`.
-- `--split-blocks 4`: when `recv_B >= 4M`, launch four CTAs.
-- In the split path, block0 issues the cross-rail GIN puts without an immediate flush, all warps in each CTA participate in the LSA `bcastMultimem` stage, and the put warps flush before the final barrier so one in-kernel iteration does not carry GIN queue pressure into the next iteration.
+- `--split-blocks 4`: when `recv_B >= 4M`, launch split CTAs. The value must be a multiple of 4, because blocks are divided evenly across the four rail/data peers.
+- `--gin-flush 0`: by default the GIN put warp does not call `gin.flush()` after the put loop. Set `--gin-flush 1` to restore explicit flush after each put loop.
+- In the split path, each data-peer group owns `split_blocks / 4` CTAs. For a remote peer group, the first CTA's first warp issues the GIN put to that peer. After the put loop, all warps in the CTA, including the put warp, participate in the LSA `bcastMultimem` stage over that peer group's chunk range.
 
 ```bash
 export AG_GIN_MASTER_ADDR=2605:340:cd51:4900:476c:99af:d4df:a32b
@@ -188,6 +211,7 @@ mpirun --allow-run-as-root -np 32 \
     --num-blocks 1 \
     --split-blocks 4 \
     --split-threshold 4M \
+    --gin-flush 0 \
     --stats-mode collective
 ```
 
@@ -205,7 +229,9 @@ Useful overrides:
 MIN_BYTES=1K MAX_BYTES=256K WARMUP=20 ITERS=1000 CHECK=1 scripts/run_allgather_gin_deviceapi_4n.sh
 KERNEL=railring scripts/run_allgather_gin_deviceapi_4n.sh
 SPLIT_BLOCKS=1 scripts/run_allgather_gin_deviceapi_4n.sh   # force one-CTA baseline
+SPLIT_BLOCKS=8 scripts/run_allgather_gin_deviceapi_4n.sh   # split blocks must be 4,8,12,...
 SPLIT_THRESHOLD=8M scripts/run_allgather_gin_deviceapi_4n.sh
+GIN_FLUSH=1 scripts/run_allgather_gin_deviceapi_4n.sh      # call gin.flush() after put loops
 ```
 
 ## Notes
