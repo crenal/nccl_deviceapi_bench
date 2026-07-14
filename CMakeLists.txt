@@ -81,10 +81,47 @@ add_executable(nccl_gin_pingpong_perf
 configure_cuda_target(nccl_gin_pingpong_perf)
 target_link_libraries(nccl_gin_pingpong_perf PRIVATE MPI::MPI_CXX)
 
+add_executable(nccl_gin_multipeer_pingpong_perf
+  test/nccl_gin_multipeer_pingpong_perf.cu)
+configure_cuda_target(nccl_gin_multipeer_pingpong_perf)
+
+add_executable(nccl_gin_negzero_pingpong_perf
+  test/nccl_gin_negzero_pingpong_perf.cu)
+configure_cuda_target(nccl_gin_negzero_pingpong_perf)
+target_link_libraries(nccl_gin_negzero_pingpong_perf PRIVATE MPI::MPI_CXX)
+
+add_executable(nccl_gin_write_bw_perf
+  test/nccl_gin_write_bw_perf.cu)
+configure_cuda_target(nccl_gin_write_bw_perf)
+target_link_libraries(nccl_gin_write_bw_perf PRIVATE MPI::MPI_CXX)
+
+add_executable(nccl_gin_pingpong_socket_perf
+  test/nccl_gin_pingpong_socket_perf.cu)
+configure_cuda_target(nccl_gin_pingpong_socket_perf)
+
+add_executable(nccl_gin_write_bw_socket_perf
+  test/nccl_gin_write_bw_socket_perf.cu)
+configure_cuda_target(nccl_gin_write_bw_socket_perf)
+
 add_executable(gin_put_signal_visibility
   test/gin_put_signal_visibility.cu)
 configure_cuda_target(gin_put_signal_visibility)
 target_link_libraries(gin_put_signal_visibility PRIVATE MPI::MPI_CXX)
+
+add_executable(gin_put_signal_pingpong_paper
+  test/gin_put_signal_pingpong_paper.cu)
+configure_cuda_target(gin_put_signal_pingpong_paper)
+target_link_libraries(gin_put_signal_pingpong_paper PRIVATE MPI::MPI_CXX)
+
+add_executable(gin_put_signal_phase_breakdown
+  test/gin_put_signal_phase_breakdown.cu)
+configure_cuda_target(gin_put_signal_phase_breakdown)
+target_link_libraries(gin_put_signal_phase_breakdown PRIVATE MPI::MPI_CXX)
+
+add_executable(gin-proxy-phase-breakdown
+  test/gin_proxy_phase_breakdown.cu)
+configure_cuda_target(gin-proxy-phase-breakdown)
+target_link_libraries(gin-proxy-phase-breakdown PRIVATE MPI::MPI_CXX)
 
 add_executable(waitsignal_perf
   test/waitsignal_perf.cu)
